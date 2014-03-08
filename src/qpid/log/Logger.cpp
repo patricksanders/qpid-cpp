@@ -24,6 +24,7 @@
 #include "qpid/sys/Time.h"
 #include "qpid/DisableExceptionLogging.h"
 
+#include "boost/version.hpp"
 #if (BOOST_VERSION >= 104000)
 #include <boost/serialization/singleton.hpp>
 #else
@@ -172,9 +173,26 @@ void Logger::configure(const Options& opts) {
 
 void Logger::reconfigure(const std::vector<std::string>& selectors) {
     options.selectors = selectors;
+    options.deselectors.clear();
     select(Selector(options));
 }
 
 void Logger::setPrefix(const std::string& p) { prefix = p; }
+
+
+bool Logger::getHiresTimestamp()
+{
+    return flags & HIRES;
+}
+
+
+void Logger::setHiresTimestamp(bool setting)
+{
+    ScopedLock l(lock);
+    if (setting)
+        flags |= HIRES;
+    else
+        flags &= ~HIRES;
+}
 
 }} // namespace qpid::log
