@@ -24,8 +24,8 @@
 # This script configures a qpid\cpp developer build environment under Windows
 # to enable working with cpp\bindings\qpid\dotnet binding source code.
 #
-# * Supports multiple versions of Visual Studio (VS2008, VS2010) as CMake
-#   generator.
+# * Supports multiple versions of Visual Studio (VS2008, VS2010, VS2012) 
+#   as CMake generator.
 #
 # * Supports 32-bit and/or 64-bit development platforms.
 #
@@ -148,10 +148,13 @@ $global:txtWH   = 'Write-Host'
 #############################
 # Visual Studio version selection dialog items and choice
 #
-[array]$global:VsVersionCmakeChoiceList = "Visual Studio 2010", "Visual Studio 2008"
+[array]$global:VsVersionCmakeChoiceList = "Visual Studio 2012", "Visual Studio 2010", "Visual Studio 2008"
 $global:vsVersion = ''
 $global:cmakeGenerator = ''
 $global:vsSubdir = ''
+$global:cmakeCompiler = ''
+$global:cmakeCommandLine32 = ''
+$global:cmakeCommandLine64 = ''
 
 #############################
 # Select-Folder
@@ -324,7 +327,8 @@ function WriteDotnetBindingEnvSetupBat
         [string] $nBits,
         [string] $outfileName,
         [string] $studioVersion,
-        [string] $studioSubdir
+        [string] $studioSubdir,
+		[string] $cmakeLine
     )
 
     $out = @("@ECHO OFF
@@ -336,6 +340,8 @@ REM
 REM     > call $outfileName
 REM     >
 REM
+REM The solution was generated with cmake command line:
+REM $cmakeLine
 ECHO %PATH% | FINDSTR /I boost > NUL
 IF %ERRORLEVEL% EQU 0 ECHO WARNING: Boost is defined in your path multiple times!
 SET PATH=$boostRoot\lib;%PATH%
@@ -352,18 +358,26 @@ ECHO Environment set for $slnName $studioVersion $vsPlatform $nBits-bit developm
 function Return-DropDown {
     if ($DropDown.SelectedItem -ne $null) {
         $global:vsVersion = $DropDown.SelectedItem.ToString()
-        if ($global:vsVersion -eq 'Visual Studio 2010') {
-            $global:cmakeGenerator = "Visual Studio 10"
-            $global:vsSubdir = "msvc10"
+        if ($global:vsVersion -eq 'Visual Studio 2012') {
+            $global:cmakeGenerator = "Visual Studio 11"
+            $global:vsSubdir = "msvc11"
+			$global:cmakeCompiler = "-vc110"
         } else {
-            if ($global:vsVersion -eq 'Visual Studio 2008') {
-                $global:cmakeGenerator = "Visual Studio 9 2008"
-                $global:vsSubdir = "msvc9"
-            } else {
-                Write-Host "Visual Studio must be 2008 or 2010"
-                exit
-            }
-        }
+			if ($global:vsVersion -eq 'Visual Studio 2010') {
+				$global:cmakeGenerator = "Visual Studio 10"
+				$global:vsSubdir = "msvc10"
+				$global:cmakeCompiler = "-vc100"
+			} else {
+				if ($global:vsVersion -eq 'Visual Studio 2008') {
+					$global:cmakeGenerator = "Visual Studio 9 2008"
+					$global:vsSubdir = "msvc9"
+					$global:cmakeCompiler = "-vc90"
+				} else {
+					Write-Host "Visual Studio must be 2008, 2010, or 2012"
+					exit
+				}
+			}
+		}
         $Form.Close()
         Write-Host "Selected generator: $global:cmakeGenerator"
     }
@@ -378,7 +392,7 @@ function SelectVisualStudioVersion {
 
     $Form.width = 350
     $Form.height = 150
-    $Form.Text = ”Select Visual Studio Version”
+    $Form.Text = "Select Visual Studio Version"
 
     $DropDown          = new-object System.Windows.Forms.ComboBox
     $DropDown.Location = new-object System.Drawing.Size(120,10)
@@ -493,10 +507,11 @@ if ($defined64) {
 # 32-bit X86
 #
 if ($make32) {
-    $env:BOOST_ROOT = "$boost32"
     cd "$build32"
     Write-Host "Running 32-bit CMake in $build32 ..."
-    CMake -G "$global:cmakeGenerator" "-DCMAKE_INSTALL_PREFIX=install_x86" $cppDir
+	$global:cmakeCommandLine32 = "CMake -G ""$global:cmakeGenerator"" ""-DBUILD_DOCS=No"" ""-DCMAKE_INSTALL_PREFIX=install_x86"" ""-DBoost_COMPILER=$global:cmakeCompiler"" ""-DBOOST_ROOT=$boost32"" $cppDir"
+	Write-Host "$global:cmakeCommadLine32"
+    CMake -G "$global:cmakeGenerator" "-DBUILD_DOCS=No" "-DCMAKE_INSTALL_PREFIX=install_x86" "-DBoost_COMPILER=$global:cmakeCompiler" "-DBOOST_ROOT=$boost32" $cppDir
 } else {
     Write-Host "Skipped 32-bit CMake."
 }
@@ -505,10 +520,11 @@ if ($make32) {
 # 64-bit X64
 #
 if ($make64) {
-    $env:BOOST_ROOT = "$boost64"
     cd "$build64"
     Write-Host "Running 64-bit CMake in $build64"
-    CMake -G "$global:cmakeGenerator Win64" "-DCMAKE_INSTALL_PREFIX=install_x64" $cppDir
+	$global:cmakeCommandLine64 = "CMake -G ""$global:cmakeGenerator Win64"" ""-DBUILD_DOCS=No"" ""-DCMAKE_INSTALL_PREFIX=install_x64"" ""-DBoost_COMPILER=$global:cmakeCompiler"" ""-DBOOST_ROOT=$boost64"" $cppDir"
+	Write-Host "$global:cmakeCommadLine64"
+    CMake -G "$global:cmakeGenerator Win64" "-DBUILD_DOCS=No" "-DCMAKE_INSTALL_PREFIX=install_x64" "-DBoost_COMPILER=$global:cmakeCompiler" "-DBOOST_ROOT=$boost64" $cppDir
 } else {
     Write-Host "Skipped 64-bit CMake."
 }
@@ -560,7 +576,8 @@ if ($defined32) {
                                         -nBits "32" `
                                   -outfileName "setenv-messaging-$global:vsSubdir-x86-32bit.bat" `
                                 -studioVersion "$global:vsVersion" `
-                                 -studioSubdir "$global:vsSubdir"
+                                 -studioSubdir "$global:vsSubdir" `
+								    -cmakeLine "$global:cmakeCommandLine32"
 
 } else {
     Write-Host "Skipped writing 32-bit scripts."
@@ -611,7 +628,8 @@ if ($defined64) {
                                         -nBits "64" `
                                   -outfileName "setenv-messaging-$global:vsSubdir-x64-64bit.bat" `
                                 -studioVersion "$global:vsVersion" `
-                                 -studioSubdir "$global:vsSubdir"
+                                 -studioSubdir "$global:vsSubdir" `
+								    -cmakeLine "$global:cmakeCommandLine64"
 
 } else {
     Write-Host "Skipped writing 64-bit scripts."

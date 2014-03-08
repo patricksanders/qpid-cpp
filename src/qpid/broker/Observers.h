@@ -48,12 +48,6 @@ class Observers
         observers.erase(i);
     }
 
-  protected:
-    typedef std::vector<boost::shared_ptr<Observer> > List;
-
-    sys::Mutex lock;
-    List observers;
-
     template <class F> void each(F f) {
         List copy;
         {
@@ -62,6 +56,12 @@ class Observers
         }
         std::for_each(copy.begin(), copy.end(), f);
     }
+
+  protected:
+    typedef std::vector<boost::shared_ptr<Observer> > List;
+
+    sys::Mutex lock;
+    List observers;
 };
 
 }} // namespace qpid::broker

@@ -23,6 +23,7 @@
 #include "qpid/sys/Mutex.h"
 #include "qpid/sys/Socket.h"
 #include "qpid/sys/Poller.h"
+#include "qpid/sys/SecuritySettings.h"
 #include "qpid/sys/Thread.h"
 #include "qpid/sys/Time.h"
 #include "qpid/log/Statement.h"
@@ -55,7 +56,7 @@ namespace {
      * the frame layer for writing into.
      */
     struct SslIoBuff : public qpid::sys::AsynchIO::BufferBase {
-        std::auto_ptr<qpid::sys::AsynchIO::BufferBase> aioBuff;
+        qpid::sys::AsynchIO::BufferBase* aioBuff;
 
         SslIoBuff (qpid::sys::AsynchIO::BufferBase *base,
                    const SecPkgContext_StreamSizes &sizes)
@@ -66,7 +67,6 @@ namespace {
         {}
 
         ~SslIoBuff() {}
-        qpid::sys::AsynchIO::BufferBase* release() { return aioBuff.release(); }
     };
 }
 
@@ -101,10 +101,7 @@ SslAsynchIO::SslAsynchIO(const qpid::sys::Socket& s,
 }
 
 SslAsynchIO::~SslAsynchIO() {
-    if (leftoverPlaintext) {
-        delete leftoverPlaintext;
-        leftoverPlaintext = 0;
-    }
+    leftoverPlaintext = 0;
 }
 
 void SslAsynchIO::queueForDeletion() {
@@ -119,6 +116,10 @@ void SslAsynchIO::queueForDeletion() {
 void SslAsynchIO::start(qpid::sys::Poller::shared_ptr poller) {
     aio->start(poller);
     startNegotiate();
+}
+
+void SslAsynchIO::createBuffers(uint32_t size) {
+    aio->createBuffers(size);
 }
 
 void SslAsynchIO::queueReadBuffer(AsynchIO::BufferBase* buff) {
@@ -148,7 +149,7 @@ void SslAsynchIO::queueWrite(AsynchIO::BufferBase* buff) {
     // encoding was working on, and adjusting counts for, the SslIoBuff.
     // Update the count of the original BufferBase before handing off to
     // the I/O layer.
-    buff = sslBuff->release();
+    buff = sslBuff->aioBuff;
     SecBuffer buffs[4];
     buffs[0].cbBuffer = schSizes.cbHeader;
     buffs[0].BufferType = SECBUFFER_STREAM_HEADER;
@@ -209,18 +210,6 @@ bool SslAsynchIO::writeQueueEmpty() {
     return aio->writeQueueEmpty();
 }
 
-/*
- * Initiate a read operation. AsynchIO::readComplete() will be
- * called when the read is complete and data is available.
- */
-void SslAsynchIO::startReading() {
-    aio->startReading();
-}
-
-void SslAsynchIO::stopReading() {
-    aio->stopReading();
-}
-
 // Queue the specified callback for invocation from an I/O thread.
 void SslAsynchIO::requestCallback(RequestCallback callback) {
     aio->requestCallback(callback);
@@ -241,11 +230,15 @@ AsynchIO::BufferBase* SslAsynchIO::getQueuedBuffer() {
     return sslBuff;
 }
 
-unsigned int SslAsynchIO::getSslKeySize() {
+SecuritySettings SslAsynchIO::getSecuritySettings() {
     SecPkgContext_KeyInfo info;
     memset(&info, 0, sizeof(info));
     ::QueryContextAttributes(&ctxtHandle, SECPKG_ATTR_KEY_INFO, &info);
-    return info.KeySize;
+
+    SecuritySettings settings;
+    settings.ssf = info.KeySize;
+    settings.authid = std::string();
+    return settings;
 }
 
 void SslAsynchIO::negotiationDone() {

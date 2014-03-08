@@ -70,18 +70,16 @@ public:
     virtual void queueForDeletion();
 
     virtual void start(qpid::sys::Poller::shared_ptr poller);
+    virtual void createBuffers(uint32_t size);
     virtual void queueReadBuffer(BufferBase* buff);
     virtual void unread(BufferBase* buff);
     virtual void queueWrite(BufferBase* buff);
     virtual void notifyPendingWrite();
     virtual void queueWriteClose();
     virtual bool writeQueueEmpty();
-    virtual void startReading();
-    virtual void stopReading();
     virtual void requestCallback(RequestCallback);
     virtual BufferBase* getQueuedBuffer();
-
-    QPID_COMMON_EXTERN unsigned int getSslKeySize();
+    virtual SecuritySettings getSecuritySettings(void);
 
 protected:
     CredHandle credHandle;
