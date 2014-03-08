@@ -1,0 +1,2 @@
+misc:Depends=debconf (>= 0.5) | debconf-2.0
+shlibs:Depends=libboost-program-options1.49.0 (>= 1.49.0-1), libc6 (>= 2.4), libgcc1 (>= 1:4.1.1), libqpidbroker2, libqpidcommon2, libqpidmessaging2, libqpidtypes1, librdmawrap2, libstdc++6 (>= 4.6), libxerces-c3.1, libxqilla6

@@ -1,0 +1,8 @@
+usr/lib/libqpidcommon.so
+usr/include/qpid/ImportExport.h
+usr/include/qpid/*.i
+usr/include/qpid/sys
+usr/include/qpid/types
+../../src/qpid/*.h usr/include/qpid
+../../src/qpid/management/*.h usr/include/qpid/management
+../../src/qpid/framing/*.h usr/include/qpid/framing
