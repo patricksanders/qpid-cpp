@@ -1,3 +1,9 @@
+qpid-cpp (0.26-3) unstable; urgency=low
+
+  * Patch /etc/sasl2/qpidd.conf to correct path of qpidd.sasldb
+
+ -- Mo McRoberts <mo.mcroberts@bbc.co.uk>  Mon, 10 Mar 2014 18:38:28 +0000
+
 qpid-cpp (0.26-2) unstable; urgency=low
 
   * Correct missing Pre-Depends

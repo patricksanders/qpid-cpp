@@ -1,0 +1,13 @@
+Index: deb-qpid-cpp/etc/sasl2/qpidd.conf
+===================================================================
+--- deb-qpid-cpp.orig/etc/sasl2/qpidd.conf	2014-03-08 21:52:50.769267457 +0000
++++ deb-qpid-cpp/etc/sasl2/qpidd.conf	2014-03-10 18:37:24.977064228 +0000
+@@ -36,7 +36,7 @@
+ #
+ pwcheck_method: auxprop
+ auxprop_plugin: sasldb
+-sasldb_path: /var/lib/qpidd/qpidd.sasldb
++sasldb_path: /etc/qpid/qpidd.sasldb
+ mech_list: ANONYMOUS DIGEST-MD5 EXTERNAL PLAIN
+ 
+ 
