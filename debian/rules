@@ -16,7 +16,7 @@ export LDFLAGS CXXFLAGS
 	dh $@ --buildsystem=cmake --builddirectory build
 
 override_dh_auto_configure:
-	dh_auto_configure -- -DSYSCONF_INSTALL_DIR=/etc -DBUILD_BINDING_PERL=OFF -DBUILD_BINDING_PYTHON=OFF -DBUILD_BINDING_RUBY=OFF
+	dh_auto_configure -- -DSYSCONF_INSTALL_DIR=/etc -DBUILD_BINDING_PERL=OFF -DBUILD_BINDING_RUBY=OFF
 
 override_dh_clean:
 	dh_clean

@@ -1,3 +1,10 @@
+qpid-cpp (0.26-2) unstable; urgency=low
+
+  * Correct missing Pre-Depends
+  * Build against libqpid-proton-dev to ensure AMQP 1.0 support
+
+ -- Mo McRoberts <mo.mcroberts@bbc.co.uk>  Sun, 09 Mar 2014 23:13:40 +0000
+
 qpid-cpp (0.26-1) unstable; urgency=low
 
   * Update to upstream 0.26 release.
