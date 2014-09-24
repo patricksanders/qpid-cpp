@@ -45,7 +45,7 @@
                 return qpid::types::Variant((int64_t) SvIV(value));
              }
             else if (SvNOK(value)) {
-                return qpid::types::Variant((float)SvNV(value));
+                return qpid::types::Variant((double)SvNV(value));
             }
             else if (SvPOK(value)) {
                 STRLEN len;
@@ -120,7 +120,7 @@
             }
             }
         } catch (qpid::types::Exception& ex) {
-            Perl_croak(aTHX_ ex.what());
+          Perl_croak(aTHX_ "%s", ex.what());
         }
 
         if (!result)

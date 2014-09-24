@@ -42,6 +42,11 @@ macro(remember_location testname)
   set (${testname}_LOCATION ${CMAKE_CURRENT_BINARY_DIR}/${testname}${CMAKE_EXECUTABLE_SUFFIX})
 endmacro(remember_location)
 
+# If we're using GCC allow variadic macros (even though they're c99 not c++01)
+if (CMAKE_COMPILER_IS_GNUCXX)
+  add_definitions(-Wno-variadic-macros)
+endif (CMAKE_COMPILER_IS_GNUCXX)
+
 # Windows uses some process-startup calls to ensure that errors, etc. don't
 # result in error boxes being thrown up. Since it's expected that most test
 # runs will be in scripts, the default is to force these outputs to stderr
@@ -55,6 +60,18 @@ if (CMAKE_SYSTEM_NAME STREQUAL Windows)
 endif (CMAKE_SYSTEM_NAME STREQUAL Windows)
 
 # Some generally useful utilities that just happen to be built in the test area
+add_executable (qpid-receive qpid-receive.cpp Statistics.cpp ${platform_test_additions})
+target_link_libraries (qpid-receive qpidmessaging qpidtypes qpidcommon "${Boost_PROGRAM_OPTIONS_LIBRARY}")
+remember_location(qpid-receive)
+
+add_executable (qpid-send qpid-send.cpp Statistics.cpp ${platform_test_additions})
+target_link_libraries (qpid-send qpidmessaging qpidtypes qpidcommon "${Boost_PROGRAM_OPTIONS_LIBRARY}")
+remember_location(qpid-send)
+
+install (TARGETS
+         qpid-receive qpid-send
+         RUNTIME DESTINATION ${QPID_INSTALL_BINDIR})
+
 add_executable (qpid-perftest qpid-perftest.cpp ${platform_test_additions})
 target_link_libraries (qpid-perftest qpidclient qpidcommon "${Boost_PROGRAM_OPTIONS_LIBRARY}")
 remember_location(qpid-perftest)
@@ -68,16 +85,8 @@ target_link_libraries (qpid-client-test qpidclient qpidcommon "${Boost_PROGRAM_O
 remember_location(qpid-client-test)
 
 add_executable (qpid-ping qpid-ping.cpp ${platform_test_additions})
-target_link_libraries (qpid-ping qpidclient qpidcommon "${Boost_PROGRAM_OPTIONS_LIBRARY}")
+target_link_libraries (qpid-ping qpidmessaging qpidtypes qpidcommon "${Boost_PROGRAM_OPTIONS_LIBRARY}")
 remember_location(qpid-ping)
-
-add_executable (qpid-receive qpid-receive.cpp Statistics.cpp ${platform_test_additions})
-target_link_libraries (qpid-receive qpidmessaging qpidtypes qpidcommon "${Boost_PROGRAM_OPTIONS_LIBRARY}")
-remember_location(qpid-receive)
-
-add_executable (qpid-send qpid-send.cpp Statistics.cpp ${platform_test_additions})
-target_link_libraries (qpid-send qpidmessaging qpidtypes qpidcommon "${Boost_PROGRAM_OPTIONS_LIBRARY}")
-remember_location(qpid-send)
 
 add_executable (qpid-topic-listener qpid-topic-listener.cpp ${platform_test_additions})
 target_link_libraries (qpid-topic-listener qpidclient qpidcommon "${Boost_PROGRAM_OPTIONS_LIBRARY}")
@@ -97,14 +106,14 @@ target_link_libraries (sender qpidmessaging qpidtypes qpidclient qpidcommon "${B
 remember_location(sender)
 
 add_executable (qpid-txtest qpid-txtest.cpp ${platform_test_additions})
-target_link_libraries (qpid-txtest qpidclient qpidcommon "${Boost_PROGRAM_OPTIONS_LIBRARY}")
+target_link_libraries (qpid-txtest qpidclient qpidcommon qpidtypes "${Boost_PROGRAM_OPTIONS_LIBRARY}")
 #qpid_txtest_SOURCES=qpid-txtest.cpp  TestOptions.h ConnectionOptions.h
 remember_location(qpid-txtest)
 
 install (TARGETS
          qpid-perftest qpid-latency-test qpid-client-test
          qpid-ping
-         qpid-receive qpid-send qpid-topic-listener qpid-topic-publisher receiver sender
+         qpid-topic-listener qpid-topic-publisher receiver sender
          qpid-txtest
          RUNTIME DESTINATION ${QPID_INSTALL_TESTDIR})
 
@@ -175,6 +184,7 @@ set(all_unit_tests
     ManagementTest
     MessageReplayTracker
     MessageTest
+    MessagingLogger
     MessagingSessionTests
     PollableCondition
     ProxyTest
@@ -247,22 +257,18 @@ endif (BUILD_SASL)
 #
 add_executable (echotest echotest.cpp ${platform_test_additions})
 target_link_libraries (echotest qpidclient qpidcommon "${Boost_PROGRAM_OPTIONS_LIBRARY}")
-#echotest_SOURCES=echotest.cpp TestOptions.h ConnectionOptions.h
 remember_location(echotest)
 
 add_executable (publish publish.cpp ${platform_test_additions})
 target_link_libraries (publish qpidclient qpidcommon "${Boost_PROGRAM_OPTIONS_LIBRARY}")
-#publish_SOURCES=publish.cpp TestOptions.h ConnectionOptions.h
 remember_location(publish)
 
 add_executable (consume consume.cpp ${platform_test_additions})
 target_link_libraries (consume qpidclient qpidcommon "${Boost_PROGRAM_OPTIONS_LIBRARY}")
-#consume_SOURCES=consume.cpp  TestOptions.h ConnectionOptions.h
 remember_location(consume)
 
 add_executable (header_test header_test.cpp ${platform_test_additions})
 target_link_libraries (header_test qpidclient qpidcommon "${Boost_PROGRAM_OPTIONS_LIBRARY}")
-#header_test_SOURCES=header_test.cpp TestOptions.h ConnectionOptions.h
 remember_location(header_test)
 
 add_executable (declare_queues declare_queues.cpp ${platform_test_additions})
@@ -279,12 +285,10 @@ remember_location(resuming_receiver)
 
 add_executable (txshift txshift.cpp ${platform_test_additions})
 target_link_libraries (txshift qpidclient qpidcommon "${Boost_PROGRAM_OPTIONS_LIBRARY}")
-#txshift_SOURCES=txshift.cpp  TestOptions.h ConnectionOptions.h
 remember_location(txshift)
 
 add_executable (txjob txjob.cpp ${platform_test_additions})
 target_link_libraries (txjob qpidclient qpidcommon "${Boost_PROGRAM_OPTIONS_LIBRARY}")
-#txjob_SOURCES=txjob.cpp  TestOptions.h ConnectionOptions.h
 remember_location(txjob)
 
 add_executable (datagen datagen.cpp ${platform_test_additions})
@@ -295,21 +299,37 @@ add_executable (msg_group_test msg_group_test.cpp ${platform_test_additions})
 target_link_libraries (msg_group_test qpidmessaging qpidtypes qpidcommon "${Boost_PROGRAM_OPTIONS_LIBRARY}")
 remember_location(msg_group_test)
 
+add_executable (ha_test_max_queues ha_test_max_queues.cpp ${platform_test_additions})
+target_link_libraries (ha_test_max_queues qpidclient qpidcommon "${Boost_PROGRAM_OPTIONS_LIBRARY}")
+remember_location(ha_test_max_queues)
+
 if (BUILD_SASL)
     add_executable (sasl_version sasl_version.cpp ${platform_test_additions})
     remember_location(sasl_version)
 endif (BUILD_SASL)
 
-# This should ideally be done as part of the test run, but I don't know a way
-# to get these arguments and the working directory set like Makefile.am does,
-# and have that run during the test pass.
-#
-# Need to check to see that the python tools are included as part of the source
-# tree first and don't install them or run dependent tests if they are not there
-#
-set (python_bld ${CMAKE_CURRENT_BINARY_DIR}/python)
-execute_process(COMMAND ${PYTHON_EXECUTABLE} setup.py install --prefix=${pythoon_bld} --install-lib=${python_bld} --install-scripts=${python_bld}/commands
-                WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/../python)
+set (python_src ${CMAKE_SOURCE_DIR}/../python)
+if (EXISTS ${python_src})
+    set (python_bld ${CMAKE_CURRENT_BINARY_DIR}/python)
+    # This will not pick up added or deleted python files
+    # In that case you need to rerun CMake
+    file(GLOB_RECURSE python_files ${python_src}/*.py)
+
+    add_custom_command(
+	OUTPUT ${python_bld}
+	DEPENDS ${python_files}
+	COMMAND ${PYTHON_EXECUTABLE}
+	    setup.py
+	    build --build-base=${python_bld}/build
+	    install --prefix=${python_bld} --install-lib=${python_bld} --install-scripts=${python_bld}/commands
+	WORKING_DIRECTORY ${python_src}
+    )
+
+    add_custom_target(
+	python_bld ALL
+	DEPENDS ${python_bld}
+    )
+endif (EXISTS ${python_src})
 
 if (BUILD_SASL)
     add_test (sasl_fed ${test_wrap} -- ${CMAKE_CURRENT_SOURCE_DIR}/sasl_fed${test_script_suffix})
@@ -344,8 +364,8 @@ add_test (federation_tests ${shell} ${CMAKE_CURRENT_SOURCE_DIR}/run_federation_t
 add_test (federation_sys_tests ${shell} ${CMAKE_CURRENT_SOURCE_DIR}/run_federation_sys_tests${test_script_suffix})
 add_test (queue_flow_limit_tests
           ${test_wrap}
-          --start-broker "--broker-options=--default-flow-stop-threshold=80 --default-flow-resume-threshold=70 -t --log-to-stderr=no --log-to-stdout=no"
-          ${CMAKE_CURRENT_SOURCE_DIR}/run_queue_flow_limit_tests${test_script_suffix})
+          --start-broker "--broker-options=--default-flow-stop-threshold=80 --default-flow-resume-threshold=70"
+          -- ${CMAKE_CURRENT_SOURCE_DIR}/run_queue_flow_limit_tests${test_script_suffix})
 if (BUILD_ACL)
   add_test (acl_tests ${shell} ${CMAKE_CURRENT_SOURCE_DIR}/run_acl_tests${test_script_suffix})
 endif (BUILD_ACL)

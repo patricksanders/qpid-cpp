@@ -24,6 +24,7 @@
 #include "qpid/messaging/Address.h"
 #include "qpid/messaging/amqp/AddressHelper.h"
 #include <string>
+#include "qpid/sys/AtomicCount.h"
 #include "qpid/sys/IntegerTypes.h"
 
 struct pn_link_t;
@@ -58,6 +59,7 @@ class ReceiverContext
     void configure();
     void verify();
     Address getAddress() const;
+    bool hasCurrent();
   private:
     friend class ConnectionContext;
     const std::string name;
@@ -65,6 +67,7 @@ class ReceiverContext
     AddressHelper helper;
     pn_link_t* receiver;
     uint32_t capacity;
+    qpid::sys::AtomicCount fetching;
     void configure(pn_terminus_t*);
 };
 }}} // namespace qpid::messaging::amqp

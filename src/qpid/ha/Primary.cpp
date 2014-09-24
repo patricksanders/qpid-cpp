@@ -33,6 +33,7 @@
 #include "qpid/broker/BrokerObserver.h"
 #include "qpid/broker/Connection.h"
 #include "qpid/broker/Queue.h"
+#include "qpid/broker/SessionHandlerObserver.h"
 #include "qpid/framing/FieldTable.h"
 #include "qpid/framing/FieldValue.h"
 #include "qpid/log/Statement.h"
@@ -87,24 +88,72 @@ class ExpectedBackupTimerTask : public sys::TimerTask {
     Primary& primary;
 };
 
+class PrimaryErrorListener : public broker::SessionHandler::ErrorListener {
+  public:
+    PrimaryErrorListener(const std::string& logPrefix_) : logPrefix(logPrefix_) {}
+
+    void connectionException(framing::connection::CloseCode code, const std::string& msg) {
+        QPID_LOG(debug, logPrefix << framing::createConnectionException(code, msg).what());
+    }
+    void channelException(framing::session::DetachCode code, const std::string& msg) {
+        QPID_LOG(debug, logPrefix << framing::createChannelException(code, msg).what());
+    }
+    void executionException(framing::execution::ErrorCode code, const std::string& msg) {
+        QPID_LOG(debug, logPrefix << framing::createSessionException(code, msg).what());
+    }
+    void incomingExecutionException(framing::execution::ErrorCode code, const std::string& msg) {
+        QPID_LOG(debug, logPrefix << "Incoming " << framing::createSessionException(code, msg).what());
+    }
+    void detach() {
+        QPID_LOG(debug, logPrefix << "Session detached.");
+    }
+
+  private:
+    std::string logPrefix;
+};
+
+class PrimarySessionHandlerObserver : public broker::SessionHandlerObserver {
+  public:
+    PrimarySessionHandlerObserver(const std::string& logPrefix)
+        : errorListener(new PrimaryErrorListener(logPrefix)) {}
+    void newSessionHandler(broker::SessionHandler& sh) {
+        BrokerInfo info;
+        // Suppress error logging for backup connections
+        // TODO aconway 2014-01-31: Be more selective, suppress only expected errors?
+        if (ha::ConnectionObserver::getBrokerInfo(sh.getConnection(), info)) {
+            sh.setErrorListener(errorListener);
+        }
+    }
+  private:
+    boost::shared_ptr<PrimaryErrorListener> errorListener;
+};
+
+
 } // namespace
 
 Primary::Primary(HaBroker& hb, const BrokerInfo::Set& expect) :
     haBroker(hb), membership(hb.getMembership()),
     logPrefix("Primary: "), active(false),
-    replicationTest(hb.getSettings().replicateDefault.get())
+    replicationTest(hb.getSettings().replicateDefault.get()),
+    sessionHandlerObserver(new PrimarySessionHandlerObserver(logPrefix)),
+    queueLimits(logPrefix, hb.getBroker().getQueues(), replicationTest)
 {
+    // Note that at this point, we are still rejecting client connections.
+    // So we are safe from client interference while we set up the primary.
+
     hb.getMembership().setStatus(RECOVERING);
-    broker::QueueRegistry& queues = hb.getBroker().getQueues();
-    queues.eachQueue(boost::bind(&Primary::initializeQueue, this, _1));
-    if (expect.empty()) {
-        QPID_LOG(notice, logPrefix << "Promoted to primary. No expected backups.");
-    }
-    else {
+
+    // Process all QueueReplicators, handles auto-delete queues.
+    QueueReplicator::Vector qrs;
+    QueueReplicator::copy(hb.getBroker().getExchanges(), qrs);
+    std::for_each(qrs.begin(), qrs.end(), boost::bind(&QueueReplicator::promoted, _1));
+
+    if (!expect.empty()) {
         // NOTE: RemoteBackups must be created before we set the BrokerObserver
         // or ConnectionObserver so that there is no client activity while
         // the QueueGuards are created.
-        QPID_LOG(notice, logPrefix << "Promoted to primary. Expected backups: " << expect);
+        QPID_LOG(notice, logPrefix << "Promoted and recovering, waiting for backups: "
+                 << expect);
         for (BrokerInfo::Set::const_iterator i = expect.begin(); i != expect.end(); ++i) {
             boost::shared_ptr<RemoteBackup> backup(new RemoteBackup(*i, 0));
             backups[i->getSystemId()] = backup;
@@ -118,6 +167,8 @@ Primary::Primary(HaBroker& hb, const BrokerInfo::Set& expect) :
     }
     brokerObserver.reset(new PrimaryBrokerObserver(*this));
     haBroker.getBroker().getBrokerObservers().add(brokerObserver);
+    haBroker.getBroker().getSessionHandlerObservers().add(sessionHandlerObserver);
+
     checkReady();               // Outside lock
 
     // Allow client connections
@@ -128,16 +179,8 @@ Primary::Primary(HaBroker& hb, const BrokerInfo::Set& expect) :
 Primary::~Primary() {
     if (timerTask) timerTask->cancel();
     haBroker.getBroker().getBrokerObservers().remove(brokerObserver);
+    haBroker.getBroker().getSessionHandlerObservers().remove(sessionHandlerObserver);
     haBroker.getObserver()->reset();
-}
-
-void Primary::initializeQueue(boost::shared_ptr<broker::Queue> q) {
-    if (replicationTest.useLevel(*q) == ALL) {
-        boost::shared_ptr<QueueReplicator> qr = haBroker.findQueueReplicator(q->getName());
-        ReplicationId firstId = qr ? qr->getMaxId()+1 : ReplicationId(1);
-        q->getMessageInterceptors().add(
-            boost::shared_ptr<IdSetter>(new IdSetter(q->getName(), firstId)));
-    }
 }
 
 void Primary::checkReady() {
@@ -148,7 +191,7 @@ void Primary::checkReady() {
             activate = active = true;
     }
     if (activate) {
-        QPID_LOG(notice, logPrefix << "Finished waiting for backups, primary is active.");
+        QPID_LOG(notice, logPrefix << "Promoted and active.");
         membership.setStatus(ACTIVE); // Outside of lock.
     }
 }
@@ -250,17 +293,17 @@ void Primary::queueCreate(const QueuePtr& q) {
     ReplicateLevel level = replicationTest.useLevel(*q);
     q->addArgument(QPID_REPLICATE, printable(level).str());
     if (level) {
-        QPID_LOG(debug, logPrefix << "Created queue " << q->getName()
-                 << " replication: " << printable(level));
-        initializeQueue(q);
         // Give each queue a unique id. Used by backups to avoid confusion of
         // same-named queues.
         q->addArgument(QPID_HA_UUID, types::Variant(Uuid(true)));
         {
             Mutex::ScopedLock l(lock);
+            queueLimits.addQueue(q); // Throws if limit exceeded
             for (BackupMap::iterator i = backups.begin(); i != backups.end(); ++i)
                 i->second->queueCreate(q);
         }
+        QPID_LOG(debug, logPrefix << "Created queue " << q->getName()
+                 << " replication: " << printable(level));
         checkReady();           // Outside lock
     }
 }
@@ -271,6 +314,7 @@ void Primary::queueDestroy(const QueuePtr& q) {
         QPID_LOG(debug, logPrefix << "Destroyed queue " << q->getName());
         {
             Mutex::ScopedLock l(lock);
+            queueLimits.removeQueue(q);
             for (BackupMap::iterator i = backups.begin(); i != backups.end(); ++i)
                 i->second->queueDestroy(q);
         }
@@ -287,7 +331,7 @@ void Primary::exchangeCreate(const ExchangePtr& ex) {
         QPID_LOG(debug, logPrefix << "Created exchange " << ex->getName()
                  << " replication: " << printable(level));
          // Give each exchange a unique id to avoid confusion of same-named exchanges.
-        args.set(QPID_HA_UUID, FieldTable::ValuePtr(new UuidValue(&Uuid(true)[0])));
+        args.set(QPID_HA_UUID, FieldTable::ValuePtr(new UuidValue(Uuid(true).data())));
     }
     ex->setArgs(args);
 }
@@ -305,6 +349,7 @@ shared_ptr<RemoteBackup> Primary::backupConnect(
     const BrokerInfo& info, broker::Connection& connection, Mutex::ScopedLock&)
 {
     shared_ptr<RemoteBackup> backup(new RemoteBackup(info, &connection));
+    queueLimits.addBackup(backup);
     backups[info.getSystemId()] = backup;
     return backup;
 }
@@ -312,6 +357,7 @@ shared_ptr<RemoteBackup> Primary::backupConnect(
 // Remove a backup. Caller should not release the shared pointer returend till
 // outside the lock.
 void Primary::backupDisconnect(shared_ptr<RemoteBackup> backup, Mutex::ScopedLock&) {
+    queueLimits.addBackup(backup);
     types::Uuid id = backup->getBrokerInfo().getSystemId();
     backup->cancel();
     expectedBackups.erase(backup);
@@ -339,6 +385,7 @@ void Primary::opened(broker::Connection& connection) {
         } else {
             QPID_LOG(info, logPrefix << "Known backup reconnection: " << info);
             i->second->setConnection(&connection);
+            backup = i->second;
         }
         if (info.getStatus() == JOINING) {
             info.setStatus(CATCHUP);
@@ -405,9 +452,8 @@ void Primary::setCatchupQueues(const RemoteBackupPtr& backup, bool createGuards)
 shared_ptr<PrimaryTxObserver> Primary::makeTxObserver(
     const boost::intrusive_ptr<broker::TxBuffer>& txBuffer)
 {
-    shared_ptr<PrimaryTxObserver> observer(
-        new PrimaryTxObserver(*this, haBroker, txBuffer));
-    observer->initialize();
+    shared_ptr<PrimaryTxObserver> observer =
+        PrimaryTxObserver::create(*this, haBroker, txBuffer);
     txMap[observer->getTxQueue()->getName()] = observer;
     return observer;
 }
@@ -417,7 +463,7 @@ void Primary::startTx(const boost::intrusive_ptr<broker::TxBuffer>& txBuffer) {
 }
 
 void Primary::startDtx(const boost::intrusive_ptr<broker::DtxBuffer>& ) {
-    QPID_LOG(notice, "DTX transactions in a HA cluster are not yet atomic");
+    QPID_LOG(warning, "DTX transactions in a HA cluster are not yet atomic");
 }
 
 }} // namespace qpid::ha

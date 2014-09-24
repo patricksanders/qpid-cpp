@@ -21,9 +21,8 @@
 
 #include "qpid/linearstore/TxnCtxt.h"
 
-#include <sstream>
-
-#include "qpid/linearstore/jrnl/jexception.h"
+#include "qpid/linearstore/DataTokenImpl.h"
+#include "qpid/linearstore/JournalImpl.h"
 #include "qpid/linearstore/StoreException.h"
 
 namespace qpid{
@@ -52,8 +51,10 @@ void TxnCtxt::commitTxn(JournalImpl* jc, bool commit) {
             } else {
                 jc->txn_abort(dtokp.get(), getXid());
             }
-        } catch (const qpid::qls_jrnl::jexception& e) {
-            THROW_STORE_EXCEPTION(std::string("Error commit") + e.what());
+        } catch (const qpid::linearstore::journal::jexception& e) {
+            std::ostringstream oss;
+            oss << "Error during " << (commit ? "commit" : "abort") << ": " << e.what();
+            THROW_STORE_EXCEPTION(oss.str());
         }
     }
 }
@@ -104,10 +105,10 @@ void TxnCtxt::sync() {
             if (preparedXidStorePtr)
                 jrnl_flush(preparedXidStorePtr);
             for (ipqItr i = impactedQueues.begin(); i != impactedQueues.end(); i++)
-                jrnl_sync(static_cast<JournalImpl*>(*i), &qpid::qls_jrnl::jcntl::_aio_cmpl_timeout);
+                jrnl_sync(static_cast<JournalImpl*>(*i), &qpid::linearstore::journal::jcntl::_aio_cmpl_timeout);
             if (preparedXidStorePtr)
-                jrnl_sync(preparedXidStorePtr, &qpid::qls_jrnl::jcntl::_aio_cmpl_timeout);
-        } catch (const qpid::qls_jrnl::jexception& e) {
+                jrnl_sync(preparedXidStorePtr, &qpid::linearstore::journal::jcntl::_aio_cmpl_timeout);
+        } catch (const qpid::linearstore::journal::jexception& e) {
             THROW_STORE_EXCEPTION(std::string("Error during txn sync: ") + e.what());
         }
     }
@@ -115,14 +116,14 @@ void TxnCtxt::sync() {
 
 void TxnCtxt::jrnl_flush(JournalImpl* jc) {
     if (jc && !(jc->is_txn_synced(getXid())))
-        jc->flush();
+        jc->flush(false);
 }
 
 void TxnCtxt::jrnl_sync(JournalImpl* jc, timespec* timeout) {
     if (!jc || jc->is_txn_synced(getXid()))
         return;
     while (jc->get_wr_aio_evt_rem()) {
-        if (jc->get_wr_events(timeout) == qpid::qls_jrnl::jerrno::AIO_TIMEOUT && timeout)
+        if (jc->get_wr_events(timeout) == qpid::linearstore::journal::jerrno::AIO_TIMEOUT && timeout)
             THROW_STORE_EXCEPTION(std::string("Error: timeout waiting for TxnCtxt::jrnl_sync()"));
     }
 }

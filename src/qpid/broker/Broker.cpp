@@ -148,6 +148,8 @@ Broker::Options::Options(const std::string& name) :
     timestampRcvMsgs(false),    // set the 0.10 timestamp delivery property
     linkMaintenanceInterval(2*sys::TIME_SEC),
     linkHeartbeatInterval(120*sys::TIME_SEC),
+    dtxDefaultTimeout(60),      // 60s
+    dtxMaxTimeout(3600),        // 3600s
     maxNegotiateTime(10000)     // 10s
 {
     int c = sys::SystemInfo::concurrency();
@@ -192,6 +194,8 @@ Broker::Options::Options(const std::string& name) :
          "Interval to check link health and re-connect  if need be")
         ("link-heartbeat-interval", optValue(linkHeartbeatInterval, "SECONDS"),
          "Heartbeat interval for a federation link")
+        ("dtx-default-timeout", optValue(dtxDefaultTimeout, "SECONDS"), "Default timeout for DTX transaction before aborting it")
+        ("dtx-max-timeout", optValue(dtxMaxTimeout, "SECONDS"), "Maximum allowed timeout for DTX transaction. A value of zero disables maximum timeout limit checks and allows arbitrarily large timeout settings.")
         ("max-negotiate-time", optValue(maxNegotiateTime, "MILLISECONDS"), "Maximum time a connection can take to send the initial protocol negotiation")
         ("federation-tag", optValue(fedTag, "NAME"), "Override the federation tag")
         ;
@@ -217,12 +221,14 @@ Broker::Broker(const Broker::Options& conf) :
     store(new NullMessageStore),
     acl(0),
     dataDir(conf.noDataDir ? std::string() : conf.dataDir),
-    pagingDir(conf.pagingDir),
+    pagingDir(!conf.pagingDir.empty() ? conf.pagingDir :
+              dataDir.isEnabled() ? dataDir.getPath() + Options::DEFAULT_PAGED_QUEUE_DIR :
+              std::string() ),
     queues(this),
     exchanges(this),
     links(this),
     factory(new SecureConnectionFactory(*this)),
-    dtxManager(*timer.get()),
+    dtxManager(*timer.get(), getOptions().dtxDefaultTimeout),
     sessionManager(
         qpid::SessionState::Configuration(
             conf.replayFlushLimit*1024, // convert kb to bytes.
@@ -385,11 +391,6 @@ Broker::Broker(const Broker::Options& conf) :
     }
 }
 
-std::string Broker::getPagingDirectoryPath()
-{
-    return pagingDir.isEnabled() ? pagingDir.getPath() : dataDir.getPath();
-}
-
 void Broker::declareStandardExchange(const std::string& name, const std::string& type)
 {
     bool storeEnabled = store.get() != NULL;
@@ -417,6 +418,12 @@ boost::intrusive_ptr<Broker> Broker::create(const Options& opts)
 
 void Broker::setStore (const boost::shared_ptr<MessageStore>& _store)
 {
+    // Exit now if multiple store plugins are attempting to load
+    if (!NullMessageStore::isNullStore(store.get())) {
+        QPID_LOG(error, "Multiple store plugins are not supported");
+        throw Exception(QPID_MSG("Failed to start broker: Multiple store plugins were loaded"));
+    }
+
     store.reset(new MessageStoreModule (_store));
     setStore();
 }
@@ -1298,10 +1305,21 @@ std::pair<boost::shared_ptr<Queue>, bool> Broker::createQueue(
         params.insert(make_pair(acl::PROP_EXCLUSIVE, owner ? _TRUE : _FALSE));
         params.insert(make_pair(acl::PROP_AUTODELETE, settings.autodelete ? _TRUE : _FALSE));
         params.insert(make_pair(acl::PROP_POLICYTYPE, settings.getLimitPolicy()));
-        params.insert(make_pair(acl::PROP_MAXQUEUECOUNT, boost::lexical_cast<string>(settings.maxDepth.getCount())));
-        params.insert(make_pair(acl::PROP_MAXQUEUESIZE, boost::lexical_cast<string>(settings.maxDepth.getSize())));
-        params.insert(make_pair(acl::PROP_MAXFILECOUNT, boost::lexical_cast<string>(settings.maxFileCount)));
-        params.insert(make_pair(acl::PROP_MAXFILESIZE, boost::lexical_cast<string>(settings.maxFileSize)));
+        params.insert(make_pair(acl::PROP_PAGING, settings.paging ? _TRUE : _FALSE));
+        if (settings.paging) {
+            params.insert(make_pair(acl::PROP_MAXPAGES, boost::lexical_cast<string>(settings.maxPages ? settings.maxPages : DEFAULT_MAX_PAGES)));
+            params.insert(make_pair(acl::PROP_MAXPAGEFACTOR, boost::lexical_cast<string>(settings.pageFactor ? settings.pageFactor : DEFAULT_PAGE_FACTOR)));
+        }
+        if (settings.maxDepth.hasCount())
+            params.insert(make_pair(acl::PROP_MAXQUEUECOUNT, boost::lexical_cast<string>(settings.maxDepth.getCount() ? settings.maxDepth.getCount() : std::numeric_limits<uint64_t>::max())));
+        if (settings.maxDepth.hasSize())
+            params.insert(make_pair(acl::PROP_MAXQUEUESIZE, boost::lexical_cast<string>(settings.maxDepth.getSize() ? settings.maxDepth.getSize() :  std::numeric_limits<uint64_t>::max())));
+        else
+            params.insert(make_pair(acl::PROP_MAXQUEUESIZE, boost::lexical_cast<string>(config.queueLimit)));
+        if (settings.durable) {
+            params.insert(make_pair(acl::PROP_MAXFILECOUNT, boost::lexical_cast<string>(settings.maxFileCount ? settings.maxFileCount : 8)));
+            params.insert(make_pair(acl::PROP_MAXFILESIZE, boost::lexical_cast<string>(settings.maxFileSize ? settings.maxFileSize : 24)));
+        }
 
         if (!acl->authorise(userId,acl::ACT_CREATE,acl::OBJ_QUEUE,name,&params) )
             throw framing::UnauthorizedAccessException(QPID_MSG("ACL denied queue create request from " << userId));

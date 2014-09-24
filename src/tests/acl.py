@@ -671,6 +671,118 @@ class ACLTests(TestBase010):
             self.fail(result)
 
 
+    def test_illegal_pages_lower_limit_spec(self):
+        """
+        Test illegal paged queue policy
+        """
+
+        aclf = self.get_acl_file()
+        aclf.write('acl deny bob@QPID create queue name=q2 pageslowerlimit=-1\n')
+        aclf.write('acl allow all all')
+        aclf.close()
+
+        result = self.reload_acl()
+        expected = "-1 is not a valid value for 'pageslowerlimit', " \
+                   "values should be between 0 and 9223372036854775807";
+        if (result.find(expected) == -1):
+            self.fail(result)
+
+        aclf = self.get_acl_file()
+        aclf.write('acl deny bob@QPID create queue name=q2 pageslowerlimit=9223372036854775808\n')
+        aclf.write('acl allow all all')
+        aclf.close()
+
+        result = self.reload_acl()
+        expected = "9223372036854775808 is not a valid value for 'pageslowerlimit', " \
+                   "values should be between 0 and 9223372036854775807";
+        if (result.find(expected) == -1):
+            self.fail(result)
+
+
+    def test_illegal_pages_upper_limit_spec(self):
+        """
+        Test illegal paged queue policy
+        """
+
+        aclf = self.get_acl_file()
+        aclf.write('acl deny bob@QPID create queue name=q2 pagesupperlimit=-1\n')
+        aclf.write('acl allow all all')
+        aclf.close()
+
+        result = self.reload_acl()
+        expected = "-1 is not a valid value for 'pagesupperlimit', " \
+                   "values should be between 0 and 9223372036854775807";
+        if (result.find(expected) == -1):
+            self.fail(result)
+
+        aclf = self.get_acl_file()
+        aclf.write('acl deny bob@QPID create queue name=q2 pagesupperlimit=9223372036854775808\n')
+        aclf.write('acl allow all all')
+        aclf.close()
+
+        result = self.reload_acl()
+        expected = "9223372036854775808 is not a valid value for 'pagesupperlimit', " \
+                   "values should be between 0 and 9223372036854775807";
+        if (result.find(expected) == -1):
+            self.fail(result)
+
+
+    def test_illegal_pagefactor_lower_limit_spec(self):
+        """
+        Test illegal paged queue policy
+        """
+
+        aclf = self.get_acl_file()
+        aclf.write('acl deny bob@QPID create queue name=q2 pagefactorlowerlimit=-1\n')
+        aclf.write('acl allow all all')
+        aclf.close()
+
+        result = self.reload_acl()
+        expected = "-1 is not a valid value for 'pagefactorlowerlimit', " \
+                   "values should be between 0 and 9223372036854775807";
+        if (result.find(expected) == -1):
+            self.fail(result)
+
+        aclf = self.get_acl_file()
+        aclf.write('acl deny bob@QPID create queue name=q2 pagefactorlowerlimit=9223372036854775808\n')
+        aclf.write('acl allow all all')
+        aclf.close()
+
+        result = self.reload_acl()
+        expected = "9223372036854775808 is not a valid value for 'pagefactorlowerlimit', " \
+                   "values should be between 0 and 9223372036854775807";
+        if (result.find(expected) == -1):
+            self.fail(result)
+
+
+    def test_illegal_pagefactor_upper_limit_spec(self):
+        """
+        Test illegal paged queue policy
+        """
+
+        aclf = self.get_acl_file()
+        aclf.write('acl deny bob@QPID create queue name=q2 pagefactorupperlimit=-1\n')
+        aclf.write('acl allow all all')
+        aclf.close()
+
+        result = self.reload_acl()
+        expected = "-1 is not a valid value for 'pagefactorupperlimit', " \
+                   "values should be between 0 and 9223372036854775807";
+        if (result.find(expected) == -1):
+            self.fail(result)
+
+        aclf = self.get_acl_file()
+        aclf.write('acl deny bob@QPID create queue name=q2 pagefactorupperlimit=9223372036854775808\n')
+        aclf.write('acl allow all all')
+        aclf.close()
+
+        result = self.reload_acl()
+        expected = "9223372036854775808 is not a valid value for 'pagefactorupperlimit', " \
+                   "values should be between 0 and 9223372036854775807";
+        if (result.find(expected) == -1):
+            self.fail(result)
+
+
    #=====================================
    # ACL queue tests
    #=====================================
@@ -687,6 +799,7 @@ class ACLTests(TestBase010):
         aclf.write('acl deny bob@QPID purge queue name=q3\n')
         aclf.write('acl deny bob@QPID delete queue name=q4\n')
         aclf.write('acl deny bob@QPID create queue name=q5 maxqueuesize=1000 maxqueuecount=100\n')
+        aclf.write('acl deny bob@QPID create queue name=q6 paging=true\n')
         aclf.write('acl allow all all')
         aclf.close()
 
@@ -733,6 +846,15 @@ class ACLTests(TestBase010):
             queue_options["qpid.max_size"] = 500
             session.queue_declare(queue="q5", exclusive=True, arguments=queue_options)
             self.fail("ACL should deny queue create request with name=q2, qpid.max_size=500 and qpid.max_count=200");
+        except qpid.session.SessionException, e:
+            self.assertEqual(403,e.args[0].error_code)
+            session = self.get_session('bob','bob')
+
+        try:
+            queue_options = {}
+            queue_options["qpid.paging"] = True
+            session.queue_declare(queue="q6", arguments=queue_options)
+            self.fail("ACL should deny queue create request with name=q6, qpid.paging=True");
         except qpid.session.SessionException, e:
             self.assertEqual(403,e.args[0].error_code)
             session = self.get_session('bob','bob')
@@ -972,6 +1094,107 @@ class ACLTests(TestBase010):
                 self.fail("ACL should allow queue delete request for q4");
 
    #=====================================
+   # ACL paged tests
+   #=====================================
+
+    def test_paged_allow_mode(self):
+        """
+        Test cases for paged acl in allow mode
+        """
+        aclf = self.get_acl_file()
+        aclf.write('acl deny bob@QPID create queue name=qf1 pageslowerlimit=1000\n')
+        aclf.write('acl deny bob@QPID create queue name=qf2 pagesupperlimit=100\n')
+        aclf.write('acl deny bob@QPID create queue name=qf3 pagefactorlowerlimit=10\n')
+        aclf.write('acl deny bob@QPID create queue name=qf4 pagefactorupperlimit=1\n')
+        aclf.write('acl allow all all')
+        aclf.close()
+
+        result = self.reload_acl()
+        if (result):
+            self.fail(result)
+
+        session = self.get_session('bob','bob')
+
+        try:
+            queue_options = {}
+            queue_options["qpid.paging"] = True
+            queue_options["qpid.max_pages_loaded"] = 500
+            session.queue_declare(queue="qf1", arguments=queue_options)
+            self.fail("ACL should deny queue create request with name=qf1, qpid.paging=True, qpid.max_pages_loaded=500");
+        except qpid.session.SessionException, e:
+            self.assertEqual(403,e.args[0].error_code)
+            session = self.get_session('bob','bob')
+
+        try:
+            queue_options = {}
+            queue_options["qpid.paging"] = True
+            queue_options["qpid.max_pages_loaded"] = 500
+            session.queue_declare(queue="qf2", arguments=queue_options)
+            self.fail("ACL should deny queue create request with name=qf2, qpid.paging=True, qpid.max_pages_loaded=500");
+        except qpid.session.SessionException, e:
+            self.assertEqual(403,e.args[0].error_code)
+            session = self.get_session('bob','bob')
+
+        try:
+            queue_options = {}
+            queue_options["qpid.paging"] = True
+            queue_options["qpid.page_factor"] = 5
+            session.queue_declare(queue="qf3", arguments=queue_options)
+            self.fail("ACL should deny queue create request with name=qf3, qpid.paging=True, qpid.page_factor=5");
+        except qpid.session.SessionException, e:
+            self.assertEqual(403,e.args[0].error_code)
+            session = self.get_session('bob','bob')
+
+        try:
+            queue_options = {}
+            queue_options["qpid.paging"] = True
+            queue_options["qpid.page_factor"] = 5
+            session.queue_declare(queue="qf4", arguments=queue_options)
+            self.fail("ACL should deny queue create request with name=qf4, qpid.paging=True, qpid.page_factor=5");
+        except qpid.session.SessionException, e:
+            self.assertEqual(403,e.args[0].error_code)
+            session = self.get_session('bob','bob')
+
+
+    def test_paged_deny_mode(self):
+        """
+        Test cases for paged acl in deny mode
+        """
+        aclf = self.get_acl_file()
+        aclf.write('acl allow bob@QPID create queue name=qf1 pageslowerlimit=100 pagesupperlimit=1000\n')
+        aclf.write('acl allow bob@QPID create queue name=qf2 pagefactorlowerlimit=1 pagefactorupperlimit=10\n')
+        aclf.write('acl allow anonymous all all\n')
+        aclf.write('acl deny all all')
+        aclf.close()
+
+        result = self.reload_acl()
+        if (result):
+            self.fail(result)
+
+        session = self.get_session('bob','bob')
+
+        try:
+            queue_options = {}
+            queue_options["qpid.paging"] = True
+            queue_options["qpid.max_pages_loaded"] = 500
+            session.queue_declare(queue="qf1", arguments=queue_options)
+        except qpid.session.SessionException, e:
+            if (403 == e.args[0].error_code):
+                self.fail("ACL should allow queue create request with name=qf1, qpid.paging=True, qpid.max_pages_loaded=500");
+            session = self.get_session('bob','bob')
+
+        try:
+            queue_options = {}
+            queue_options["qpid.paging"] = True
+            queue_options["qpid.page_factor"] = 5
+            session.queue_declare(queue="qf2", arguments=queue_options)
+        except qpid.session.SessionException, e:
+            if (403 == e.args[0].error_code):
+                self.fail("ACL should allow queue create request with name=qf2, qpid.paging=True, qpid.page_factor=5");
+            session = self.get_session('bob','bob')
+
+
+   #=====================================
    # ACL file tests
    #=====================================
 
@@ -1011,7 +1234,7 @@ class ACLTests(TestBase010):
             queue_options = {}
             queue_options["qpid.file_count"] = 200
             queue_options["qpid.file_size"] = 500
-            session.queue_declare(queue="qf5", exclusive=True, arguments=queue_options)
+            session.queue_declare(queue="qf5", exclusive=True, durable=True, arguments=queue_options)
             self.fail("ACL should deny queue create request with name=qf5, qpid.file_size=500 and qpid.file_count=200");
         except qpid.session.SessionException, e:
             self.assertEqual(403,e.args[0].error_code)
@@ -1165,7 +1388,7 @@ class ACLTests(TestBase010):
             queue_options = {}
             queue_options["qpid.file_count"] = 200
             queue_options["qpid.file_size"] = 500
-            session.queue_declare(queue="qfd5", arguments=queue_options)
+            session.queue_declare(queue="qfd5", durable=True, arguments=queue_options)
             self.fail("ACL should deny queue create request with name=qfd5 filemaxsizeupperlimit=500 filemaxcountupperlimit=200");
         except qpid.session.SessionException, e:
             self.assertEqual(403,e.args[0].error_code)
@@ -1175,7 +1398,7 @@ class ACLTests(TestBase010):
             queue_options = {}
             queue_options["qpid.file_count"] = 100
             queue_options["qpid.file_size"] = 500
-            session.queue_declare(queue="qfd5", arguments=queue_options)
+            session.queue_declare(queue="qfd5", durable=True, arguments=queue_options)
         except qpid.session.SessionException, e:
             if (403 == e.args[0].error_code):
                 self.fail("ACL should allow queue create request with name=qfd5 filemaxsizeupperlimit=500 filemaxcountupperlimit=200");
@@ -1184,7 +1407,7 @@ class ACLTests(TestBase010):
             queue_options = {}
             queue_options["qpid.file_count"] = 49
             queue_options["qpid.file_size"] = 100
-            session.queue_declare(queue="qfd6", arguments=queue_options)
+            session.queue_declare(queue="qfd6", durable=True, arguments=queue_options)
             self.fail("ACL should deny queue create request with name=qfd6 filemaxsizeupperlimit=100 filemaxcountupperlimit=49");
         except qpid.session.SessionException, e:
             self.assertEqual(403,e.args[0].error_code)
@@ -1194,7 +1417,7 @@ class ACLTests(TestBase010):
             queue_options = {}
             queue_options["qpid.file_count"] = 101
             queue_options["qpid.file_size"] = 100
-            session.queue_declare(queue="qfd6", arguments=queue_options)
+            session.queue_declare(queue="qfd6", durable=True, arguments=queue_options)
             self.fail("ACL should allow queue create request with name=qfd6 filemaxsizeupperlimit=100 filemaxcountupperlimit=101");
         except qpid.session.SessionException, e:
             self.assertEqual(403,e.args[0].error_code)
@@ -1204,7 +1427,7 @@ class ACLTests(TestBase010):
             queue_options = {}
             queue_options["qpid.file_count"] = 100
             queue_options["qpid.file_size"] = 49
-            session.queue_declare(queue="qfd6", arguments=queue_options)
+            session.queue_declare(queue="qfd6", durable=True, arguments=queue_options)
             self.fail("ACL should deny queue create request with name=qfd6 filemaxsizeupperlimit=49 filemaxcountupperlimit=100");
         except qpid.session.SessionException, e:
             self.assertEqual(403,e.args[0].error_code)
@@ -1214,7 +1437,7 @@ class ACLTests(TestBase010):
             queue_options = {}
             queue_options["qpid.file_count"] = 100
             queue_options["qpid.file_size"] =101
-            session.queue_declare(queue="qfd6", arguments=queue_options)
+            session.queue_declare(queue="qfd6", durable=True, arguments=queue_options)
             self.fail("ACL should deny queue create request with name=qfd6 filemaxsizeupperlimit=101 filemaxcountupperlimit=100");
         except qpid.session.SessionException, e:
             self.assertEqual(403,e.args[0].error_code)
@@ -1224,7 +1447,7 @@ class ACLTests(TestBase010):
             queue_options = {}
             queue_options["qpid.file_count"] = 50
             queue_options["qpid.file_size"] = 50
-            session.queue_declare(queue="qfd6", arguments=queue_options)
+            session.queue_declare(queue="qfd6", durable=True, arguments=queue_options)
         except qpid.session.SessionException, e:
             if (403 == e.args[0].error_code):
                 self.fail("ACL should allow queue create request with name=qfd6 filemaxsizeupperlimit=50 filemaxcountupperlimit=50");

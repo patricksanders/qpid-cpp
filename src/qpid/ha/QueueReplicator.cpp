@@ -21,8 +21,9 @@
 
 #include "Event.h"
 #include "HaBroker.h"
+#include "IdSetter.h"
 #include "QueueReplicator.h"
-#include "QueueSnapshots.h"
+#include "QueueSnapshot.h"
 #include "ReplicatingSubscription.h"
 #include "Settings.h"
 #include "types.h"
@@ -33,12 +34,12 @@
 #include "qpid/broker/QueueObserver.h"
 #include "qpid/broker/QueueRegistry.h"
 #include "qpid/broker/SessionHandler.h"
-#include "qpid/broker/SessionHandler.h"
 #include "qpid/framing/FieldTable.h"
 #include "qpid/log/Statement.h"
 #include "qpid/Msg.h"
 #include "qpid/assert.h"
 #include <boost/shared_ptr.hpp>
+#include <boost/weak_ptr.hpp>
 #include <boost/bind.hpp>
 
 
@@ -50,6 +51,7 @@ using namespace framing::execution;
 using namespace std;
 using std::exception;
 using sys::Mutex;
+using boost::shared_ptr;
 
 const std::string QueueReplicator::QPID_SYNC_FREQUENCY("qpid.sync_frequency");
 
@@ -61,23 +63,44 @@ bool QueueReplicator::isReplicatorName(const std::string& name) {
     return startsWith(name, QUEUE_REPLICATOR_PREFIX);
 }
 
+namespace {
+void pushIfQr(QueueReplicator::Vector& v, const shared_ptr<Exchange>& ex) {
+    shared_ptr<QueueReplicator> qr = boost::dynamic_pointer_cast<QueueReplicator>(ex);
+    if (qr) v.push_back(qr);
+}
+}
+
+void QueueReplicator::copy(ExchangeRegistry& registry, Vector& result) {
+    registry.eachExchange(boost::bind(&pushIfQr, boost::ref(result), _1));
+}
+
+// Debug log expected exceptions on queue replicator, check incoming execution
+// exceptions for "deleted on primary" conditions.
 class QueueReplicator::ErrorListener : public SessionHandler::ErrorListener {
   public:
     ErrorListener(const boost::shared_ptr<QueueReplicator>& qr)
         : queueReplicator(qr), logPrefix(qr->logPrefix) {}
 
-    void connectionException(framing::connection::CloseCode, const std::string&) {}
-    void channelException(framing::session::DetachCode, const std::string&) {}
-    void executionException(framing::execution::ErrorCode, const std::string&) {}
-
-    void incomingExecutionException(ErrorCode e, const std::string& msg) {
-        queueReplicator->incomingExecutionException(e, msg);
+    void connectionException(framing::connection::CloseCode code, const std::string& msg) {
+        QPID_LOG(debug, logPrefix << framing::createConnectionException(code, msg).what());
+    }
+    void channelException(framing::session::DetachCode code, const std::string& msg) {
+        QPID_LOG(debug, logPrefix << framing::createChannelException(code, msg).what());
+    }
+    void executionException(framing::execution::ErrorCode code, const std::string& msg) {
+        QPID_LOG(debug, logPrefix << framing::createSessionException(code, msg).what());
+    }
+    void incomingExecutionException(ErrorCode code, const std::string& msg) {
+        boost::shared_ptr<QueueReplicator> qr = queueReplicator.lock();
+        if (qr && !qr->deletedOnPrimary(code, msg))
+            QPID_LOG(error, logPrefix << "Incoming "
+                     << framing::createSessionException(code, msg).what());
     }
     void detach() {
         QPID_LOG(debug, logPrefix << "Session detached");
     }
   private:
-    boost::shared_ptr<QueueReplicator> queueReplicator;
+    boost::weak_ptr<QueueReplicator> queueReplicator;
     std::string logPrefix;
 };
 
@@ -91,10 +114,21 @@ class QueueReplicator::QueueObserver : public broker::QueueObserver {
     void consumerAdded( const Consumer& ) {}
     void consumerRemoved( const Consumer& ) {}
     // Queue observer is destroyed when the queue is.
-    void destroy() { queueReplicator->destroy(); }
+    void destroy() {
+        boost::shared_ptr<QueueReplicator> qr = queueReplicator.lock();
+        if (qr) qr->destroy();
+    }
   private:
-    boost::shared_ptr<QueueReplicator> queueReplicator;
+    boost::weak_ptr<QueueReplicator> queueReplicator;
 };
+
+boost::shared_ptr<QueueReplicator> QueueReplicator::create(
+    HaBroker& hb, boost::shared_ptr<broker::Queue> q, boost::shared_ptr<broker::Link> l)
+{
+    boost::shared_ptr<QueueReplicator> qr(new QueueReplicator(hb, q, l));
+    qr->initialize();
+    return qr;
+}
 
 QueueReplicator::QueueReplicator(HaBroker& hb,
                                  boost::shared_ptr<Queue> q,
@@ -110,12 +144,18 @@ QueueReplicator::QueueReplicator(HaBroker& hb,
       settings(hb.getSettings()),
       nextId(0), maxId(0)
 {
+    // The QueueReplicator will take over setting replication IDs.
+    boost::shared_ptr<IdSetter> setter =
+        q->getMessageInterceptors().findType<IdSetter>();
+    if (setter) q->getMessageInterceptors().remove(setter);
+
     args.setString(QPID_REPLICATE, printable(NONE).str());
     Uuid uuid(true);
     bridgeName = replicatorName(q->getName()) + std::string(".") + uuid.str();
     framing::FieldTable args = getArgs();
     args.setString(QPID_REPLICATE, printable(NONE).str());
     setArgs(args);
+    // Don't allow backup queues to auto-delete, primary decides when to delete.
     if (q->isAutoDelete()) q->markInUse();
 
     dispatch[DequeueEvent::KEY] =
@@ -126,9 +166,7 @@ QueueReplicator::QueueReplicator(HaBroker& hb,
 
 QueueReplicator::~QueueReplicator() {}
 
-// This must be called immediately after the constructor.
-// It has to be separate so we can call shared_from_this().
-void QueueReplicator::activate() {
+void QueueReplicator::initialize() {
     Mutex::ScopedLock l(lock);
     QPID_LOG(debug, logPrefix << "Created");
     if (!queue) return;         // Already destroyed
@@ -138,8 +176,7 @@ void QueueReplicator::activate() {
         throw Exception(QPID_MSG("Duplicate queue replicator " << getName()));
 
     // Enable callback to initializeBridge
-    std::pair<Bridge::shared_ptr, bool> result =
-    queue->getBroker()->getLinks().declare(
+    boost::shared_ptr<Bridge> b = queue->getBroker()->getLinks().declare(
         bridgeName,
         *link,
         false,              // durable
@@ -156,13 +193,13 @@ void QueueReplicator::activate() {
         // Include shared_ptr to self to ensure we are not deleted
         // before initializeBridge is called.
         boost::bind(&QueueReplicator::initializeBridge, shared_from_this(), _1, _2)
-    );
-    bridge = result.first;
-    bridge->setErrorListener(
+    ).first;
+    b->setErrorListener(
         boost::shared_ptr<ErrorListener>(new ErrorListener(shared_from_this())));
+    bridge = b;                 // bridge is a weak_ptr to avoid a cycle.
 
     // Enable callback to destroy()
-    queue->addObserver(
+    queue->getObservers().add(
         boost::shared_ptr<QueueObserver>(new QueueObserver(shared_from_this())));
 }
 
@@ -173,19 +210,24 @@ void QueueReplicator::disconnect() {
 
 // Called from Queue::destroyed()
 void QueueReplicator::destroy() {
+    QPID_LOG(debug, logPrefix << "Destroyed");
     boost::shared_ptr<Bridge> bridge2; // To call outside of lock
     {
         Mutex::ScopedLock l(lock);
         if (!queue) return;     // Already destroyed
-        QPID_LOG(debug, logPrefix << "Destroyed");
-        bridge2 = bridge;       // call close outside the lock.
-        // Need to drop shared pointers to avoid pointer cycles keeping this in memory.
-        queue.reset();
-        bridge.reset();
-        getBroker()->getExchanges().destroy(getName());
+        bridge2 = bridge.lock(); // !call close outside the lock.
+        destroy(l);
     }
     if (bridge2) bridge2->close(); // Outside of lock, avoid deadlock.
 }
+
+void QueueReplicator::destroy(Mutex::ScopedLock&) {
+    // Need to drop shared pointers to avoid pointer cycles keeping this in memory.
+    queue.reset();
+    bridge.reset();
+    getBroker()->getExchanges().destroy(getName());
+}
+
 
 // Called in a broker connection thread when the bridge is created.
 // Note: called with the Link lock held.
@@ -199,8 +241,9 @@ void QueueReplicator::initializeBridge(Bridge& bridge, SessionHandler& sessionHa
     arguments.setString(ReplicatingSubscription::QPID_REPLICATING_SUBSCRIPTION, getType());
     arguments.setInt(QPID_SYNC_FREQUENCY, 1); // TODO aconway 2012-05-22: optimize?
     arguments.setTable(ReplicatingSubscription::QPID_BROKER_INFO, brokerInfo.asFieldTable());
-    arguments.setString(ReplicatingSubscription::QPID_ID_SET,
-                        encodeStr(haBroker.getQueueSnapshots()->get(queue)->snapshot()));
+    boost::shared_ptr<QueueSnapshot> qs = queue->getObservers().findType<QueueSnapshot>();
+    if (qs) arguments.setString(ReplicatingSubscription::QPID_ID_SET, encodeStr(qs->getSnapshot()));
+
     try {
         peer.getMessage().subscribe(
             args.i_src, args.i_dest, 0/*accept-explicit*/, 1/*not-acquired*/,
@@ -215,7 +258,7 @@ void QueueReplicator::initializeBridge(Bridge& bridge, SessionHandler& sessionHa
     }
     qpid::Address primary;
     link->getRemoteAddress(primary);
-    QPID_LOG(info, logPrefix << "Connected to " << primary << "(" << bridgeName << ")");
+    QPID_LOG(debug, logPrefix << "Connected to " << primary << "(" << bridgeName << ")");
     QPID_LOG(trace, logPrefix << "Subscription arguments: " << arguments);
 }
 
@@ -241,6 +284,7 @@ void QueueReplicator::dequeueEvent(const string& data, Mutex::ScopedLock&) {
 }
 
 // Called in connection thread of the queues bridge to primary.
+
 void QueueReplicator::route(Deliverable& deliverable)
 {
     try {
@@ -280,23 +324,19 @@ void QueueReplicator::idEvent(const string& data, Mutex::ScopedLock&) {
     nextId = decodeStr<IdEvent>(data).id;
 }
 
-ReplicationId QueueReplicator::getMaxId() {
-    Mutex::ScopedLock l(lock);
-    return maxId;
-}
-
-void QueueReplicator::incomingExecutionException(ErrorCode e, const std::string& msg) {
+bool QueueReplicator::deletedOnPrimary(ErrorCode e, const std::string& msg) {
     if (e == ERROR_CODE_NOT_FOUND || e == ERROR_CODE_RESOURCE_DELETED) {
         // If the queue is destroyed at the same time we are subscribing, we may
         // get a not-found or resource-deleted exception before the
         // BrokerReplicator gets the queue-delete event. Shut down the bridge by
         // calling destroy(), we can let the BrokerReplicator delete the queue
         // when the queue-delete arrives.
-        QPID_LOG(debug, logPrefix << "Deleted on primary: " << msg);
+        QPID_LOG(debug, logPrefix << "Deleted on primary: "
+                 << framing::createSessionException(e, msg).what());
         destroy();
+        return true;
     }
-    else
-        QPID_LOG(error, logPrefix << "Incoming execution exception: " << msg);
+    return false;
 }
 
 // Unused Exchange methods.
@@ -306,5 +346,21 @@ bool QueueReplicator::isBound(boost::shared_ptr<Queue>, const std::string* const
 bool QueueReplicator::hasBindings() { return false; }
 std::string QueueReplicator::getType() const { return ReplicatingSubscription::QPID_QUEUE_REPLICATOR; }
 
+void QueueReplicator::promoted() {
+    if (queue) {
+        // On primary QueueReplicator no longer sets IDs, start an IdSetter.
+        queue->getMessageInterceptors().add(
+            boost::shared_ptr<IdSetter>(new IdSetter(maxId+1)));
+        // Process auto-deletes
+        if (queue->isAutoDelete() && subscribed) {
+            // Make a temporary shared_ptr to prevent premature deletion of queue.
+            // Otherwise scheduleAutoDelete can call this->destroy, which resets this->queue
+            // which could delete the queue while it's still running it's destroyed logic.
+            boost::shared_ptr<Queue> q(queue);
+            q->releaseFromUse();
+            q->scheduleAutoDelete();
+        }
+    }
+}
 
 }} // namespace qpid::broker

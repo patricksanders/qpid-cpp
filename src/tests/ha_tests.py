@@ -22,6 +22,7 @@ import os, signal, sys, time, imp, re, subprocess, glob, random, logging, shutil
 import traceback
 from qpid.messaging import Message, SessionError, NotFound, ConnectionError, ReceiverError, Connection, Timeout, Disposition, REJECTED, Empty, ServerError
 from qpid.datatypes import uuid4, UUID
+from qpid.harness import Skipped
 from brokertest import *
 from ha_test import *
 from threading import Thread, Lock, Condition
@@ -33,6 +34,14 @@ log = getLogger(__name__)
 
 class HaBrokerTest(BrokerTest):
     """Base class for HA broker tests"""
+
+def alt_setup(session, suffix):
+    # Create exchange to use as alternate and a queue bound to it.
+    # altex exchange: acts as alternate exchange
+    session.sender("altex%s;{create:always,node:{type:topic,x-declare:{type:'fanout'}}}"%(suffix))
+    # altq queue bound to altex, collect re-routed messages.
+    session.sender("altq%s;{create:always,node:{x-bindings:[{exchange:'altex%s',queue:altq%s}]}}"%(suffix,suffix,suffix))
+
 
 class ReplicationTests(HaBrokerTest):
     """Correctness tests for  HA replication."""
@@ -225,6 +234,33 @@ class ReplicationTests(HaBrokerTest):
             c.close()
         finally: l.restore()
 
+
+    def test_heartbeat_python(self):
+        """Verify that a python client with a heartbeat specified disconnects
+        from a stalled broker and does not hang indefinitely."""
+
+        broker = Broker(self)
+        broker_addr = broker.host_port()
+
+        # Case 1: Connect before stalling the broker, use the connection after stalling.
+        c = Connection(broker_addr, heartbeat=1)
+        c.open()
+        os.kill(broker.pid, signal.SIGSTOP) # Stall the broker
+        self.assertRaises(ConnectionError, c.session().sender, "foo")
+
+        # Case 2: Connect to a stalled broker
+        c = Connection(broker_addr, heartbeat=1)
+        self.assertRaises(ConnectionError, c.open)
+
+        # Case 3: Re-connect to a stalled broker.
+        broker2 = Broker(self)
+        c = Connection(broker2.host_port(), heartbeat=1, reconnect_limit=1,
+                       reconnect=True, reconnect_urls=[broker_addr],
+                       reconnect_log=False) # Hide expected warnings
+        c.open()
+        broker2.kill()          # Cause re-connection to broker
+        self.assertRaises(ConnectionError, c.session().sender, "foo")
+
     def test_failover_cpp(self):
         """Verify that failover works in the C++ client."""
         cluster = HaCluster(self, 2)
@@ -245,8 +281,6 @@ class ReplicationTests(HaBrokerTest):
         """Verify that a backup broker fails over and recovers queue state"""
         brokers = HaCluster(self, 3)
         brokers[0].connect().session().sender("q;{create:always}").send("a")
-        for b in brokers[1:]: b.assert_browse_backup("q", ["a"], msg=b)
-        brokers[0].expect = EXPECT_EXIT_FAIL
         brokers.kill(0)
         brokers[1].connect().session().sender("q").send("b")
         brokers[2].assert_browse_backup("q", ["a","b"])
@@ -254,6 +288,13 @@ class ReplicationTests(HaBrokerTest):
         self.assertEqual("a", s.receiver("q").fetch().content)
         s.acknowledge()
         brokers[2].assert_browse_backup("q", ["b"])
+
+    def test_empty_backup_failover(self):
+        """Verify that a new primary becomes active with no queues.
+        Regression test for QPID-5430"""
+        brokers = HaCluster(self, 3)
+        brokers.kill(0)
+        brokers[1].wait_status("active")
 
     def test_qpid_config_replication(self):
         """Set up replication via qpid-config"""
@@ -264,33 +305,34 @@ class ReplicationTests(HaBrokerTest):
 
     def test_standalone_queue_replica(self):
         """Test replication of individual queues outside of cluster mode"""
-        l = LogLevel(ERROR) # Hide expected WARNING log messages from failover.
-        try:
-            primary = HaBroker(self, name="primary", ha_cluster=False,
-                               args=["--ha-queue-replication=yes"]);
-            pc = primary.connect()
-            ps = pc.session().sender("q;{create:always}")
-            pr = pc.session().receiver("q;{create:always}")
-            backup = HaBroker(self, name="backup", ha_cluster=False,
-                              args=["--ha-queue-replication=yes"])
-            br = backup.connect().session().receiver("q;{create:always}")
+        primary = HaBroker(self, name="primary", ha_cluster=False,
+                           args=["--ha-queue-replication=yes"]);
+        pc = primary.connect()
+        ps = pc.session().sender("q;{create:always}")
+        pr = pc.session().receiver("q;{create:always}")
+        backup = HaBroker(self, name="backup", ha_cluster=False,
+                          args=["--ha-queue-replication=yes"])
+        bs = backup.connect().session()
+        br = bs.receiver("q;{create:always}")
 
-            # Set up replication with qpid-ha
-            backup.replicate(primary.host_port(), "q")
-            ps.send("a", timeout=1)
-            backup.assert_browse_backup("q", ["a"])
-            ps.send("b", timeout=1)
-            backup.assert_browse_backup("q", ["a", "b"])
-            self.assertEqual("a", pr.fetch().content)
-            pr.session.acknowledge()
-            backup.assert_browse_backup("q", ["b"])
+        def srange(*args): return [str(i) for i in xrange(*args)]
 
-            # Set up replication with qpid-config
-            ps2 = pc.session().sender("q2;{create:always}")
-            backup.config_replicate(primary.host_port(), "q2");
-            ps2.send("x", timeout=1)
-            backup.assert_browse_backup("q2", ["x"])
-        finally: l.restore()
+        for m in srange(3): ps.send(m)
+        # Set up replication with qpid-ha
+        backup.replicate(primary.host_port(), "q")
+        backup.assert_browse_backup("q", srange(3))
+        for m in srange(3,6): ps.send(str(m))
+        backup.assert_browse_backup("q", srange(6))
+        self.assertEqual("0", pr.fetch().content)
+        pr.session.acknowledge()
+        backup.assert_browse_backup("q", srange(1,6))
+
+        # Set up replication with qpid-config
+        ps2 = pc.session().sender("q2;{create:always}")
+        backup.config_replicate(primary.host_port(), "q2");
+        ps2.send("x", timeout=1)
+        backup.assert_browse_backup("q2", ["x"])
+
 
     def test_standalone_queue_replica_failover(self):
         """Test individual queue replication from a cluster to a standalone
@@ -718,19 +760,44 @@ acl deny all all
         except NotFound: pass
         assert not cluster[1].agent().getQueue("q") # Should not be in QMF
 
-    def alt_setup(self, session, suffix):
-        # Create exchange to use as alternate and a queue bound to it.
-        # altex exchange: acts as alternate exchange
-        session.sender("altex%s;{create:always,node:{type:topic,x-declare:{type:'fanout'}}}"%(suffix))
-        # altq queue bound to altex, collect re-routed messages.
-        session.sender("altq%s;{create:always,node:{x-bindings:[{exchange:'altex%s',queue:altq%s}]}}"%(suffix,suffix,suffix))
+    def test_auto_delete_failover(self):
+        """Test auto-delete queues. Verify that:
+        - queues auto-deleted on the primary are deleted on the backup.
+        - auto-delete queues with/without timeout are deleted after a failover.
+        - messages are correctly routed to the alternate exchange.
+        """
+        cluster = HaCluster(self, 3)
+        s = cluster[0].connect().session()
+        def setup(q, timeout=""):
+            if timeout: timeout = ",arguments:{'qpid.auto_delete_timeout':%s}"%timeout
+            # Create alternate exchange, auto-delete queue and queue bound to alt. ex.
+            s.sender("%s-altex;{create:always,node:{type:topic,x-declare:{type:fanout}}}"%q)
+            qs = s.sender("%s;{create:always,node:{x-declare:{auto-delete:True,alternate-exchange:%s-altex%s}}}"%(q,q,timeout))
+            s.sender("%s-altq;{create:always,node:{x-bindings:[{exchange:%s-altex,queue:%s-altq}]}}"%(q,q,q))
+            qs.send(q) # Send a message to the auto-delete queue
+            return s
+
+        for args in [("q1",""),("q2","0"),("q3","1"),("q4",""),("q5","")]: setup(*args)
+        receivers = [s.receiver("q%s"%i) for i in [1,2,3,4]] # Subscribe to queues
+        # Note q5 is never subscribed to, so should not be auto-deleted.
+        receivers[3].close()    # Trigger auto-delete for q4
+        cluster[0].kill(final=False)
+        cluster[2].promote()
+        cluster.restart(0)
+        cluster[2].assert_browse("q3",["q3"]) # Not yet auto-deleted, 1 sec timeout.
+        for i in [2,1,0]:
+            for q in ["q1", "q2", "q3","q4"]:
+                cluster[i].wait_no_queue(q,timeout=2)      # auto-deleted
+                cluster[i].assert_browse_backup("%s-altq"%q, [q]) # Routed to alternate
+            cluster[i].assert_browse_backup("q5", ["q5"]) # Never subscribed, not deleted.
+            cluster[i].assert_browse_backup("q5-altq", [])
 
     def test_auto_delete_close(self):
         """Verify auto-delete queues are deleted on backup if auto-deleted
         on primary"""
         cluster=HaCluster(self, 2)
         p = cluster[0].connect().session()
-        self.alt_setup(p, "1")
+        alt_setup(p, "1")
         r = p.receiver("adq1;{create:always,node:{x-declare:{auto-delete:True,alternate-exchange:'altex1'}}}", capacity=1)
         s = p.sender("adq1")
         for m in ["aa","bb","cc"]: s.send(m)
@@ -741,71 +808,6 @@ acl deny all all
         cluster[1].wait_no_queue("adq1")
         cluster[1].assert_browse_backup("altq1", ["aa","bb","cc"])
         cluster[1].wait_queue("adq2")
-
-    def test_auto_delete_crash(self):
-        """Verify auto-delete queues are deleted on backup if the primary crashes"""
-        cluster=HaCluster(self, 2)
-        p = cluster[0].connect().session()
-        self.alt_setup(p,"1")
-
-        # adq1 is subscribed so will be auto-deleted.
-        r = p.receiver("adq1;{create:always,node:{x-declare:{auto-delete:True,alternate-exchange:'altex1'}}}", capacity=1)
-        s = p.sender("adq1")
-        for m in ["aa","bb","cc"]: s.send(m)
-        # adq2 is subscribed after cluster[2] starts.
-        p.sender("adq2;{create:always,node:{x-declare:{auto-delete:True}}}")
-        # adq3 is never subscribed.
-        p.sender("adq3;{create:always,node:{x-declare:{auto-delete:True}}}")
-
-        cluster.start()
-        cluster[2].wait_status("ready")
-
-        p.receiver("adq2")      # Subscribed after cluster[2] joined
-
-        for q in ["adq1","adq2","adq3","altq1"]: cluster[1].wait_queue(q)
-        for q in ["adq1","adq2","adq3","altq1"]: cluster[2].wait_queue(q)
-        cluster[0].kill()
-
-        cluster[1].wait_no_queue("adq1")
-        cluster[1].wait_no_queue("adq2")
-        cluster[1].wait_queue("adq3")
-
-        cluster[2].wait_no_queue("adq1")
-        cluster[2].wait_no_queue("adq2")
-        cluster[2].wait_queue("adq3")
-
-        cluster[1].assert_browse_backup("altq1", ["aa","bb","cc"])
-        cluster[2].assert_browse_backup("altq1", ["aa","bb","cc"])
-
-    def test_auto_delete_timeout(self):
-        cluster = HaCluster(self, 2)
-        # Test timeout
-        r1 = cluster[0].connect().session().receiver("q1;{create:always,node:{x-declare:{auto-delete:True,arguments:{'qpid.auto_delete_timeout':1}}}}")
-        # Test special case of timeout = 0
-        r0 = cluster[0].connect().session().receiver("q0;{create:always,node:{x-declare:{auto-delete:True,arguments:{'qpid.auto_delete_timeout':0}}}}")
-        cluster[1].wait_queue("q0")
-        cluster[1].wait_queue("q1")
-        cluster[0].kill()
-        cluster[1].wait_queue("q1")    # Not timed out yet
-        cluster[1].wait_no_queue("q1", timeout=5) # Wait for timeout
-        cluster[1].wait_no_queue("q0", timeout=5) # Wait for timeout
-
-    def test_alt_exchange_dup(self):
-        """QPID-4349: if a queue has an alterante exchange and is deleted the
-        messages appear twice on the alternate, they are rerouted once by the
-        primary and again by the backup."""
-        cluster = HaCluster(self,2)
-
-        # Set up q with alternate exchange altex bound to altq.
-        s = cluster[0].connect().session()
-        s.sender("altex;{create:always,node:{type:topic,x-declare:{type:'fanout'}}}")
-        s.sender("altq;{create:always,node:{x-bindings:[{exchange:'altex',queue:altq}]}}")
-        snd = s.sender("q;{create:always,node:{x-declare:{alternate-exchange:'altex'}}}")
-        messages = [ str(n) for n in xrange(10) ]
-        for m in messages: snd.send(m)
-        cluster[1].assert_browse_backup("q", messages)
-        s.sender("q;{delete:always}").close()
-        cluster[1].assert_browse_backup("altq", messages)
 
     def test_expired(self):
         """Regression test for QPID-4379: HA does not properly handle expired messages"""
@@ -883,6 +885,19 @@ acl deny all all
         old_sess.exchange_declare(exchange='ex1', type='fanout')
         cluster[1].wait_backup("ex1")
 
+    def test_resource_limit_bug(self):
+        """QPID-5666 Regression test: Incorrect resource limit exception for queue creation."""
+        cluster = HaCluster(self, 3)
+        qs = ["q%s"%i for i in xrange(10)]
+        s = cluster[0].connect().session()
+        s.sender("q;{create:always}").close()
+        cluster.kill(0)
+        cluster[1].promote()
+        cluster[1].wait_status("active")
+        s = cluster[1].connect().session()
+        s.receiver("q;{delete:always}").close()
+        s.sender("qq;{create:always}").close()
+                
 def fairshare(msgs, limit, levels):
     """
     Generator to return prioritised messages in expected order for a given fairshare limit
@@ -1076,6 +1091,18 @@ class LongTests(HaBrokerTest):
                 queue.qmf_event(r.fetch())
         finally:
             for t in threads: t.stopped = True; t.join()
+
+    def test_max_queues(self):
+        """Verify that we behave properly if we try to exceed the max number
+        of replicated queues - currently limited by the max number of channels
+        in the replication link"""
+        # This test is very slow (3 mins), skip it unless duration() > 1 minute.
+        if self.duration() < 60: return
+        # This test is written in C++ for speed, it takes a long time
+        # to create 64k queues in python. See ha_test_max_queues.cpp.
+        cluster = HaCluster(self, 2)
+        test = self.popen(["ha_test_max_queues", cluster[0].host_port()])
+        self.assertEqual(test.wait(), 0)
 
 class RecoveryTests(HaBrokerTest):
     """Tests for recovery after a failure."""
@@ -1516,6 +1543,11 @@ class TransactionTests(HaBrokerTest):
         for s in sessions: s.connection.close()
 
     def test_broker_tx_tests(self):
+        try:
+            import qpid_tests.broker_0_10
+        except ImportError:
+            raise Skipped("Tests not found")
+
         cluster = HaCluster(self, 3)
         print "Running python broker tx tests"
         p = subprocess.Popen(["qpid-python-test",

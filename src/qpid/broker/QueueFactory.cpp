@@ -48,6 +48,7 @@ QueueFactory::QueueFactory() : broker(0), store(0), parent(0) {}
 boost::shared_ptr<Queue> QueueFactory::create(const std::string& name, const QueueSettings& settings)
 {
     settings.validate();
+    boost::shared_ptr<QueueFlowLimit> flow_ptr(QueueFlowLimit::createLimit(name, settings));
 
     //1. determine Queue type (i.e. whether we are subclassing Queue)
     // -> if 'ring' policy is in use then subclass
@@ -75,11 +76,13 @@ boost::shared_ptr<Queue> QueueFactory::create(const std::string& name, const Que
             QPID_LOG(warning, "Cannot create paged queue without broker context");
         } else if (!qpid::sys::MemoryMappedFile::isSupported()) {
             QPID_LOG(warning, "Cannot create paged queue; memory mapped file support not available on this platform");
+        } else if ( !broker->getPagingDir().isEnabled() ) {
+            QPID_LOG(warning, "Cannot create paged queue; no paging directory enabled");
         } else {
-            queue->messages = std::auto_ptr<Messages>(new PagedQueue(name, broker->getPagingDirectoryPath(),
-                                                                     settings.maxPages ? settings.maxPages : 4,
-                                                                     settings.pageFactor ? settings.pageFactor : 1,
-                                                                     broker->getProtocolRegistry()));
+            queue->messages = std::auto_ptr<Messages>(new PagedQueue(name, broker->getPagingDir().getPath(),
+                                                                     settings.maxPages ? settings.maxPages : DEFAULT_MAX_PAGES,
+                                                                     settings.pageFactor ? settings.pageFactor : DEFAULT_PAGE_FACTOR,
+                                                                     broker->getProtocolRegistry(), broker->getExpiryPolicy()));
         }
     } else if (settings.lvqKey.empty()) {//LVQ already handled above
         queue->messages = std::auto_ptr<Messages>(new MessageDeque());
@@ -89,7 +92,7 @@ boost::shared_ptr<Queue> QueueFactory::create(const std::string& name, const Que
     if (settings.groupKey.size()) {
         boost::shared_ptr<MessageGroupManager> mgm(MessageGroupManager::create( name, *(queue->messages), settings));
         queue->allocator = mgm;
-        queue->addObserver(mgm);
+        queue->getObservers().add(mgm);
     } else {
         queue->allocator = boost::shared_ptr<MessageDistributor>(new FifoDistributor( *(queue->messages) ));
     }
@@ -100,7 +103,9 @@ boost::shared_ptr<Queue> QueueFactory::create(const std::string& name, const Que
         ThresholdAlerts::observe(*queue, *(broker->getManagementAgent()), settings, broker->getOptions().queueThresholdEventRatio);
     }
     //5. flow control config
-    QueueFlowLimit::observe(*queue, settings);
+    if (flow_ptr) {
+	flow_ptr->observe(*queue);
+    }
 
     return queue;
 }

@@ -26,7 +26,6 @@
 #include "QueueGuard.h"
 #include "RemoteBackup.h"
 #include "ReplicatingSubscription.h"
-#include "QueueReplicator.h"
 
 #include "qpid/broker/Broker.h"
 #include "qpid/broker/Queue.h"
@@ -83,6 +82,14 @@ class PrimaryTxObserver::Exchange : public broker::Exchange {
 
 const string PrimaryTxObserver::Exchange::TYPE_NAME(string(QPID_HA_PREFIX)+"primary-tx-observer");
 
+boost::shared_ptr<PrimaryTxObserver> PrimaryTxObserver::create(
+    Primary& p, HaBroker& hb, const boost::intrusive_ptr<broker::TxBuffer>& tx) {
+    boost::shared_ptr<PrimaryTxObserver> pto(new PrimaryTxObserver(p, hb, tx));
+    pto->initialize();
+    return pto;
+}
+
+
 PrimaryTxObserver::PrimaryTxObserver(
     Primary& p, HaBroker& hb, const boost::intrusive_ptr<broker::TxBuffer>& tx
 ) :
@@ -91,7 +98,8 @@ PrimaryTxObserver::PrimaryTxObserver(
     replicationTest(hb.getSettings().replicateDefault.get()),
     txBuffer(tx),
     id(true),
-    exchangeName(TRANSACTION_REPLICATOR_PREFIX+id.str())
+    exchangeName(TRANSACTION_REPLICATOR_PREFIX+id.str()),
+    empty(true)
 {
     logPrefix = "Primary transaction "+shortStr(id)+": ";
 
@@ -121,7 +129,7 @@ void PrimaryTxObserver::initialize() {
         throw InvalidArgumentException(
             QPID_MSG(logPrefix << "TX replication queue already exists."));
     txQueue = result.first;
-    txQueue->markInUse(true); // Prevent auto-delete till we are done.
+    txQueue->markInUse(); // Prevent auto-delete till we are done.
     txQueue->deliver(TxBackupsEvent(backups).message());
 
 }
@@ -142,6 +150,7 @@ void PrimaryTxObserver::enqueue(const QueuePtr& q, const broker::Message& m)
     if (replicationTest.useLevel(*q) == ALL) { // Ignore unreplicated queues.
         QPID_LOG(trace, logPrefix << "Enqueue: " << LogMessageId(*q, m));
         checkState(SENDING, "Too late for enqueue");
+        empty = false;
         enqueues[q] += m.getReplicationId();
         txQueue->deliver(TxEnqueueEvent(q->getName(), m.getReplicationId()).message());
         txQueue->deliver(m);
@@ -155,11 +164,8 @@ void PrimaryTxObserver::dequeue(
     checkState(SENDING, "Too late for dequeue");
     if (replicationTest.useLevel(*q) == ALL) { // Ignore unreplicated queues.
         QPID_LOG(trace, logPrefix << "Dequeue: " << LogMessageId(*q, pos, id));
+        empty = false;
         txQueue->deliver(TxDequeueEvent(q->getName(), id).message());
-    }
-    else {
-        QPID_LOG(warning, logPrefix << "Dequeue skipped, queue not replicated: "
-                 << LogMessageId(*q, pos, id));
     }
 }
 
@@ -214,8 +220,10 @@ void PrimaryTxObserver::commit() {
 }
 
 void PrimaryTxObserver::rollback() {
-    QPID_LOG(debug, logPrefix << "Rollback");
     Mutex::ScopedLock l(lock);
+    // Don't bleat about rolling back empty transactions, this happens all the time
+    // when a session closes and rolls back its outstanding transaction.
+    if (!empty) QPID_LOG(debug, logPrefix << "Rollback");
     if (state != ENDED) {
         txQueue->deliver(TxRollbackEvent().message());
         end(l);
@@ -228,7 +236,8 @@ void PrimaryTxObserver::end(Mutex::ScopedLock&) {
     // If there are no outstanding completions, break pointer cycle here.
     // Otherwise break it in cancel() when the remaining completions are done.
     if (incomplete.empty()) txBuffer = 0;
-    txQueue->releaseFromUse(true); // txQueue will auto-delete
+    txQueue->releaseFromUse();  // txQueue will auto-delete
+    txQueue->scheduleAutoDelete();
     txQueue.reset();
     try {
         broker.getExchanges().destroy(getExchangeName());
@@ -279,7 +288,6 @@ void PrimaryTxObserver::txPrepareFailEvent(const string& data) {
 void PrimaryTxObserver::cancel(const ReplicatingSubscription& rs) {
     Mutex::ScopedLock l(lock);
     types::Uuid backup = rs.getBrokerInfo().getSystemId();
-    QPID_LOG(debug, logPrefix << "Backup disconnected: " << backup);
     // Normally the backup should be completed before it is cancelled.
     if (completed(backup, l)) error(backup, "Unexpected disconnect:", l);
     // Break the pointer cycle if backups have completed and we are done with txBuffer.

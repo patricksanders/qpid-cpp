@@ -25,6 +25,7 @@
 #include "SenderContext.h"
 #include "SessionContext.h"
 #include "Transport.h"
+#include "qpid/amqp/descriptors.h"
 #include "qpid/messaging/exceptions.h"
 #include "qpid/messaging/AddressImpl.h"
 #include "qpid/messaging/Duration.h"
@@ -34,8 +35,12 @@
 #include "qpid/framing/ProtocolInitiation.h"
 #include "qpid/framing/Uuid.h"
 #include "qpid/log/Statement.h"
+#include "qpid/sys/SecurityLayer.h"
 #include "qpid/sys/SystemInfo.h"
 #include "qpid/sys/Time.h"
+#include "qpid/sys/urlAdd.h"
+#include "config.h"
+#include <boost/lexical_cast.hpp>
 #include <vector>
 extern "C" {
 #include <proton/engine.h>
@@ -44,18 +49,48 @@ extern "C" {
 namespace qpid {
 namespace messaging {
 namespace amqp {
+namespace {
+
+//remove conditional when 0.5 is no longer supported
+#ifdef HAVE_PROTON_TRACER
+void do_trace(pn_transport_t* transport, const char* message)
+{
+    ConnectionContext* c = reinterpret_cast<ConnectionContext*>(pn_transport_get_context(transport));
+    if (c) c->trace(message);
+}
+
+void set_tracer(pn_transport_t* transport, void* context)
+{
+    pn_transport_set_context(transport, context);
+    pn_transport_set_tracer(transport, &do_trace);
+}
+#else
+void set_tracer(pn_transport_t*, void*)
+{
+}
+#endif
+}
+
+void ConnectionContext::trace(const char* message) const
+{
+    QPID_LOG_CAT(trace, protocol, "[" << identifier << "]: " << message);
+}
 
 ConnectionContext::ConnectionContext(const std::string& url, const qpid::types::Variant::Map& o)
     : qpid::messaging::ConnectionOptions(o),
+      fullUrl(url, protocol.empty() ? qpid::Address::TCP : protocol),
       engine(pn_transport()),
       connection(pn_connection()),
       //note: disabled read/write of header as now handled by engine
       writeHeader(false),
       readHeader(false),
       haveOutput(false),
-      state(DISCONNECTED)
+      state(DISCONNECTED),
+      codecAdapter(*this)
 {
-    urls.insert(urls.begin(), url);
+    // Concatenate all known URLs into a single URL, get rid of duplicate addresses.
+    sys::urlAddStrings(fullUrl, urls.begin(), urls.end(), protocol.empty() ?
+                       qpid::Address::TCP : protocol);
     if (pn_transport_bind(engine, connection)) {
         //error
     }
@@ -65,7 +100,10 @@ ConnectionContext::ConnectionContext(const std::string& url, const qpid::types::
     pn_connection_set_container(connection, identifier.c_str());
     bool enableTrace(false);
     QPID_LOG_TEST_CAT(trace, protocol, enableTrace);
-    if (enableTrace) pn_transport_trace(engine, PN_TRACE_FRM);
+    if (enableTrace) {
+        pn_transport_trace(engine, PN_TRACE_FRM);
+        set_tracer(engine, this);
+    }
 }
 
 ConnectionContext::~ConnectionContext()
@@ -80,6 +118,17 @@ bool ConnectionContext::isOpen() const
 {
     qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
     return state == CONNECTED && pn_connection_state(connection) & (PN_LOCAL_ACTIVE | PN_REMOTE_ACTIVE);
+}
+
+void ConnectionContext::sync(boost::shared_ptr<SessionContext> ssn)
+{
+    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+    //wait for outstanding sends to settle
+    while (!ssn->settled()) {
+        QPID_LOG(debug, "Waiting for sends to settle on sync()");
+        wait(ssn);//wait until message has been confirmed
+    }
+    checkClosed(ssn);
 }
 
 void ConnectionContext::endSession(boost::shared_ptr<SessionContext> ssn)
@@ -140,6 +189,11 @@ void ConnectionContext::close()
 
 bool ConnectionContext::fetch(boost::shared_ptr<SessionContext> ssn, boost::shared_ptr<ReceiverContext> lnk, qpid::messaging::Message& message, qpid::messaging::Duration timeout)
 {
+    /**
+     * For fetch() on a receiver with zero capacity, need to reissue the
+     * credit on reconnect, so track the fetches in progress.
+     */
+    qpid::sys::AtomicCount::ScopedIncrement track(lnk->fetching);
     {
         qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
         checkClosed(ssn, lnk);
@@ -221,6 +275,23 @@ bool ConnectionContext::get(boost::shared_ptr<SessionContext> ssn, boost::shared
     return false;
 }
 
+boost::shared_ptr<ReceiverContext> ConnectionContext::nextReceiver(boost::shared_ptr<SessionContext> ssn, qpid::messaging::Duration timeout)
+{
+    qpid::sys::AbsTime until(convert(timeout));
+    while (true) {
+        qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+        checkClosed(ssn);
+        boost::shared_ptr<ReceiverContext> r = ssn->nextReceiver();
+        if (r) {
+            return r;
+        } else if (until > qpid::sys::now()) {
+            waitUntil(ssn, until);
+        } else {
+            return boost::shared_ptr<ReceiverContext>();
+        }
+    }
+}
+
 void ConnectionContext::acknowledge(boost::shared_ptr<SessionContext> ssn, qpid::messaging::Message* message, bool cumulative)
 {
     qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
@@ -257,6 +328,21 @@ void ConnectionContext::detach(boost::shared_ptr<SessionContext> ssn, boost::sha
 void ConnectionContext::detach(boost::shared_ptr<SessionContext> ssn, boost::shared_ptr<ReceiverContext> lnk)
 {
     qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+    pn_link_drain(lnk->receiver, 0);
+    wakeupDriver();
+    //Not all implementations handle drain correctly, so limit the
+    //time spent waiting for it
+    qpid::sys::AbsTime until(qpid::sys::now(), qpid::sys::TIME_SEC*2);
+    while (pn_link_credit(lnk->receiver) > pn_link_queued(lnk->receiver) && until > qpid::sys::now()) {
+        QPID_LOG(debug, "Waiting for credit to be drained: credit=" << pn_link_credit(lnk->receiver) << ", queued=" << pn_link_queued(lnk->receiver));
+        waitUntil(ssn, lnk, until);
+    }
+    //release as yet unfetched messages:
+    for (pn_delivery_t* d = pn_link_current(lnk->receiver); d; d = pn_link_current(lnk->receiver)) {
+        pn_link_advance(lnk->receiver);
+        pn_delivery_update(d, PN_RELEASED);
+        pn_delivery_settle(d);
+    }
     if (pn_link_state(lnk->receiver) & PN_LOCAL_ACTIVE) {
         lnk->close();
     }
@@ -401,27 +487,35 @@ void ConnectionContext::reset()
     pn_transport_bind(engine, connection);
 }
 
-void ConnectionContext::check()
-{
-    if (state == DISCONNECTED) {
+void ConnectionContext::check() {
+    if (checkDisconnected()) {
         if (ConnectionOptions::reconnect) {
-            reset();
+            QPID_LOG(notice, "Auto-reconnecting to " << fullUrl);
             autoconnect();
+            QPID_LOG(notice, "Auto-reconnected to " << currentUrl);
         } else {
             throw qpid::messaging::TransportFailure("Disconnected (reconnect disabled)");
         }
     }
-    if ((pn_connection_state(connection) & REQUIRES_CLOSE) == REQUIRES_CLOSE) {
-        pn_condition_t* error = pn_connection_remote_condition(connection);
-        std::stringstream text;
-        if (pn_condition_is_set(error)) {
-            text << "Connection closed by peer with " << pn_condition_get_name(error) << ": " << pn_condition_get_description(error);
-        } else {
-            text << "Connection closed by peer";
+}
+
+bool ConnectionContext::checkDisconnected() {
+    if (state == DISCONNECTED) {
+        reset();
+    } else {
+        if ((pn_connection_state(connection) & REQUIRES_CLOSE) == REQUIRES_CLOSE) {
+            pn_condition_t* error = pn_connection_remote_condition(connection);
+            std::stringstream text;
+            if (pn_condition_is_set(error)) {
+                text << "Connection closed by peer with " << pn_condition_get_name(error) << ": " << pn_condition_get_description(error);
+            } else {
+                text << "Connection closed by peer";
+            }
+            pn_connection_close(connection);
+            throw qpid::messaging::ConnectionError(text.str());
         }
-        pn_connection_close(connection);
-        throw qpid::messaging::ConnectionError(text.str());
     }
+    return state == DISCONNECTED;
 }
 
 void ConnectionContext::wait()
@@ -479,7 +573,7 @@ void ConnectionContext::checkClosed(boost::shared_ptr<SessionContext> ssn)
         pn_session_close(ssn->session);
         throw qpid::messaging::SessionError(text.str());
     } else if ((pn_session_state(ssn->session) & IS_CLOSED) == IS_CLOSED) {
-        throw qpid::messaging::SessionError("Session has ended");
+        throw qpid::messaging::SessionClosed();
     }
 }
 
@@ -505,14 +599,22 @@ void ConnectionContext::checkClosed(boost::shared_ptr<SessionContext> ssn, pn_li
     checkClosed(ssn);
     if ((pn_link_state(lnk) & REQUIRES_CLOSE) == REQUIRES_CLOSE) {
         pn_condition_t* error = pn_link_remote_condition(lnk);
+        std::string name;
         std::stringstream text;
         if (pn_condition_is_set(error)) {
-            text << "Link detached by peer with " << pn_condition_get_name(error) << ": " << pn_condition_get_description(error);
+            name = pn_condition_get_name(error);
+            text << "Link detached by peer with " << name << ": " << pn_condition_get_description(error);
         } else {
             text << "Link detached by peer";
         }
         pn_link_close(lnk);
-        throw qpid::messaging::LinkError(text.str());
+        if (name == qpid::amqp::error_conditions::NOT_FOUND) {
+            throw qpid::messaging::NotFound(text.str());
+        } else if (name == qpid::amqp::error_conditions::UNAUTHORIZED_ACCESS) {
+            throw qpid::messaging::UnauthorizedAccess(text.str());
+        } else {
+            throw qpid::messaging::LinkError(text.str());
+        }
     } else if ((pn_link_state(lnk) & IS_CLOSED) == IS_CLOSED) {
         throw qpid::messaging::LinkError("Link is not attached");
     }
@@ -535,7 +637,11 @@ void ConnectionContext::restartSession(boost::shared_ptr<SessionContext> s)
     }
     for (SessionContext::ReceiverMap::iterator i = s->receivers.begin(); i != s->receivers.end(); ++i) {
         QPID_LOG(debug, id << " reattaching receiver " << i->first);
-        attach(s, i->second->receiver, i->second->capacity);
+        if (i->second->capacity) {
+            attach(s, i->second->receiver, i->second->capacity);
+        } else {
+            attach(s, i->second->receiver, (uint32_t) i->second->fetching);
+        }
         i->second->verify();
         QPID_LOG(debug, id << " receiver " << i->first << " reattached");
     }
@@ -718,6 +824,11 @@ qpid::sys::Codec& ConnectionContext::getCodec()
     return *this;
 }
 
+const qpid::messaging::ConnectionOptions* ConnectionContext::getOptions()
+{
+    return this;
+}
+
 std::size_t ConnectionContext::decode(const char* buffer, std::size_t size)
 {
     qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
@@ -797,22 +908,12 @@ void ConnectionContext::open()
     qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
     if (state != DISCONNECTED) throw qpid::messaging::ConnectionError("Connection was already opened!");
     if (!driver) driver = DriverImpl::getDefault();
-
+    QPID_LOG(info, "Starting connection to " << fullUrl);
     autoconnect();
 }
 
 
 namespace {
-std::string asString(const std::vector<std::string>& v) {
-    std::stringstream os;
-    os << "[";
-    for(std::vector<std::string>::const_iterator i = v.begin(); i != v.end(); ++i ) {
-        if (i != v.begin()) os << ", ";
-        os << *i;
-    }
-    os << "]";
-    return os.str();
-}
 double FOREVER(std::numeric_limits<double>::max());
 bool expired(const sys::AbsTime& start, double timeout)
 {
@@ -825,131 +926,115 @@ bool expired(const sys::AbsTime& start, double timeout)
 const std::string COLON(":");
 }
 
+void throwConnectFail(const Url& url, const std::string& msg) {
+    throw qpid::messaging::TransportFailure(
+        Msg() << "Connect failed to " << url << ": " << msg);
+}
+
 void ConnectionContext::autoconnect()
 {
     qpid::sys::AbsTime started(qpid::sys::now());
-    QPID_LOG(debug, "Starting connection, urls=" << asString(urls));
-    for (double i = minReconnectInterval; !tryConnect(); i = std::min(i*2, maxReconnectInterval)) {
-        if (!ConnectionOptions::reconnect) {
-            throw qpid::messaging::TransportFailure("Failed to connect (reconnect disabled)");
-        }
-        if (limit >= 0 && retries++ >= limit) {
-            throw qpid::messaging::TransportFailure("Failed to connect within reconnect limit");
-        }
-        if (expired(started, timeout)) {
-            throw qpid::messaging::TransportFailure("Failed to connect within reconnect timeout");
-        }
-        QPID_LOG(debug, "Connection retry in " << i*1000*1000 << " microseconds, urls="
-                 << asString(urls));
+    for (double i = minReconnectInterval; !tryConnectUrl(fullUrl); i = std::min(i*2, maxReconnectInterval)) {
+        if (!ConnectionOptions::reconnect) throwConnectFail(fullUrl, "Reconnect disabled");
+        if (limit >= 0 && retries++ >= limit) throwConnectFail(fullUrl, "Exceeded retries");
+        if (expired(started, timeout)) throwConnectFail(fullUrl, "Exceeded timeout");
+        QPID_LOG(debug, "Connection retry in " << i*1000*1000 << " microseconds to"
+                 << fullUrl);
         qpid::sys::usleep(int64_t(i*1000*1000)); // Sleep in microseconds.
     }
     retries = 0;
 }
 
-bool ConnectionContext::tryConnect()
-{
-    for (std::vector<std::string>::const_iterator i = urls.begin(); i != urls.end(); ++i) {
-        try {
-            QPID_LOG(info, "Trying to connect to " << *i << "...");
-            if (tryConnect(qpid::Url(*i, protocol.empty() ? qpid::Address::TCP : protocol))) {
-                return true;
-            }
-        } catch (const qpid::messaging::TransportFailure& e) {
-            QPID_LOG(info, "Failed to connect to " << *i << ": " << e.what());
-        }
-    }
-    return false;
-}
-
-void ConnectionContext::reconnect(const std::string& url)
-{
+void ConnectionContext::reconnect(const Url& url) {
+    QPID_LOG(notice, "Reconnecting to " << url);
     qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
     if (state != DISCONNECTED) throw qpid::messaging::ConnectionError("Connection was already opened!");
     if (!driver) driver = DriverImpl::getDefault();
     reset();
-    if (!tryConnect(qpid::Url(url, protocol.empty() ? qpid::Address::TCP : protocol))) {
-        throw qpid::messaging::TransportFailure("Failed to connect");
+    if (!tryConnectUrl(url)) throwConnectFail(url, "Failed to reconnect");
+    QPID_LOG(notice, "Reconnected to " << currentUrl);
+}
+
+void ConnectionContext::reconnect(const std::string& url) { reconnect(Url(url)); }
+
+void ConnectionContext::reconnect() { reconnect(fullUrl); }
+
+void ConnectionContext::waitNoReconnect() {
+    if (!checkDisconnected()) {
+        lock.wait();
+        checkDisconnected();
     }
 }
 
-void ConnectionContext::reconnect()
-{
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
-    if (state != DISCONNECTED) throw qpid::messaging::ConnectionError("Connection was already opened!");
-    if (!driver) driver = DriverImpl::getDefault();
-    reset();
-    if (!tryConnect()) {
-        throw qpid::messaging::TransportFailure("Failed to reconnect");
-    }
-}
-
-bool ConnectionContext::tryConnect(const Url& url)
+// Try to connect to a URL, i.e. try to connect to each of its addresses in turn
+// till one succeeds or they all fail.
+// @return true if we connect successfully
+bool ConnectionContext::tryConnectUrl(const Url& url)
 {
     if (url.getUser().size()) username = url.getUser();
     if (url.getPass().size()) password = url.getPass();
 
     for (Url::const_iterator i = url.begin(); i != url.end(); ++i) {
-        if (tryConnect(*i)) {
+        QPID_LOG(info, "Connecting to " << *i);
+        if (tryConnectAddr(*i) && tryOpenAddr(*i)) {
             QPID_LOG(info, "Connected to " << *i);
-            setCurrentUrl(*i);
-            if (sasl.get()) {
-                wakeupDriver();
-                while (!sasl->authenticated()) {
-                    QPID_LOG(debug, id << " Waiting to be authenticated...");
-                    wait();
-                }
-                QPID_LOG(debug, id << " Authenticated");
-            }
-
-            QPID_LOG(debug, id << " Opening...");
-            setProperties();
-            pn_connection_open(connection);
-            wakeupDriver(); //want to write
-            while (pn_connection_state(connection) & PN_REMOTE_UNINIT) {
-                wait();
-            }
-            if (!(pn_connection_state(connection) & PN_REMOTE_ACTIVE)) {
-                throw qpid::messaging::ConnectionError("Failed to open connection");
-            }
-            QPID_LOG(debug, id << " Opened");
-
-            return restartSessions();
+            return true;
         }
     }
     return false;
 }
 
-void ConnectionContext::setCurrentUrl(const qpid::Address& a)
-{
-    std::stringstream u;
-    u << a;
-    currentUrl = u.str();
+// Try to open an AMQP protocol connection on an address, after we have already
+// established a transport connect (see tryConnectAddr below)
+// @return true if the AMQP connection is succesfully opened.
+bool ConnectionContext::tryOpenAddr(const qpid::Address& addr) {
+    currentUrl = Url(addr);
+    if (sasl.get()) {
+        wakeupDriver();
+        while (!sasl->authenticated() && state != DISCONNECTED) {
+            QPID_LOG(debug, id << " Waiting to be authenticated...");
+            waitNoReconnect();
+        }
+        if (state == DISCONNECTED) return false;
+        QPID_LOG(debug, id << " Authenticated");
+    }
+
+    QPID_LOG(debug, id << " Opening...");
+    setProperties();
+    pn_connection_open(connection);
+    wakeupDriver(); //want to write
+    while ((pn_connection_state(connection) & PN_REMOTE_UNINIT) &&
+           state != DISCONNECTED)
+        waitNoReconnect();
+    if (state == DISCONNECTED) return false;
+    if (!(pn_connection_state(connection) & PN_REMOTE_ACTIVE)) {
+        throw qpid::messaging::ConnectionError("Failed to open connection");
+    }
+    QPID_LOG(debug, id << " Opened");
+
+    return restartSessions();
 }
 
 std::string ConnectionContext::getUrl() const
 {
     qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
-    if (state == CONNECTED) {
-        return currentUrl;
-    } else {
-        return std::string();
-    }
+    return (state == CONNECTED) ? currentUrl.str() : std::string();
 }
 
-
-bool ConnectionContext::tryConnect(const qpid::Address& address)
+// Try to establish a transport connect to an individual address (typically a
+// TCP host:port)
+// @return true if we succeed in connecting.
+bool ConnectionContext::tryConnectAddr(const qpid::Address& address)
 {
     transport = driver->getTransport(address.protocol, *this);
-    std::stringstream port;
-    port << address.port;
-    id = address.host + COLON + port.str();
+    id = boost::lexical_cast<std::string>(address);
     if (useSasl()) {
         sasl = std::auto_ptr<Sasl>(new Sasl(id, *this, address.host));
     }
     state = CONNECTING;
     try {
         QPID_LOG(debug, id << " Connecting ...");
-        transport->connect(address.host, port.str());
+        transport->connect(address.host, boost::lexical_cast<std::string>(address.port));
         bool waiting(true);
         while (waiting) {
             switch (state) {
@@ -961,7 +1046,6 @@ bool ConnectionContext::tryConnect(const qpid::Address& address)
                 break;
               case DISCONNECTED:
                 waiting = false;
-                QPID_LOG(debug, id << " Failed to connect");
                 break;
             }
         }
@@ -984,6 +1068,25 @@ bool ConnectionContext::restartSessions()
         QPID_LOG(debug, "Connection Failed to re-initialize sessions: " << e.what());
         return false;
     }
+}
+
+void ConnectionContext::initSecurityLayer(qpid::sys::SecurityLayer& s)
+{
+    s.init(&codecAdapter);
+}
+
+ConnectionContext::CodecAdapter::CodecAdapter(ConnectionContext& c) : context(c) {}
+std::size_t ConnectionContext::CodecAdapter::decode(const char* buffer, std::size_t size)
+{
+    return context.decodePlain(buffer, size);
+}
+std::size_t ConnectionContext::CodecAdapter::encode(char* buffer, std::size_t size)
+{
+    return context.encodePlain(buffer, size);
+}
+bool ConnectionContext::CodecAdapter::canEncode()
+{
+    return context.canEncodePlain();
 }
 
 

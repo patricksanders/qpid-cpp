@@ -59,6 +59,7 @@ class Connection : public BrokerContext, public sys::ConnectionCodec, public Man
     pn_transport_t* getTransport();
     void setUserId(const std::string&);
     void abort();
+    void trace(const char*) const;
   protected:
     typedef std::map<pn_session_t*, boost::shared_ptr<Session> > Sessions;
     pn_connection_t* connection;
@@ -68,12 +69,14 @@ class Connection : public BrokerContext, public sys::ConnectionCodec, public Man
     bool haveOutput;
     Sessions sessions;
     bool closeInitiated;
+    bool closeRequested;
 
     virtual void process();
     std::string getError();
     void close();
     void open();
     void readPeerProperties();
+    void closedByManagement();
 };
 }}} // namespace qpid::broker::amqp
 

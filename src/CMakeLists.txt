@@ -155,7 +155,12 @@ if (VALGRIND_FOUND)
 endif (VALGRIND_FOUND)
 
 # Do not keep on linking against transitive library dependencies
+# TODO Need to rework CMake files to use INTERFACE_LINK_LIBRARIES target property
+# When that is done we can remove the next 4 lines completely
 set (CMAKE_LINK_INTERFACE_LIBRARIES "")
+if (DEFINED CMAKE_VERSION AND NOT CMAKE_VERSION VERSION_LESS "2.8.12")
+  cmake_policy(SET CMP0022 OLD)
+endif (DEFINED CMAKE_VERSION AND NOT CMAKE_VERSION VERSION_LESS "2.8.12")
 
 if (CMAKE_COMPILER_IS_GNUCXX)
    # Warnings: Enable as many as possible, keep the code clean. Please
@@ -183,13 +188,10 @@ if (CMAKE_COMPILER_IS_GNUCXX)
      set (HIDE_SYMBOL_FLAGS "-fno-visibility-inlines-hidden")
    else (GCC_VERSION VERSION_EQUAL 4.1.2)
      set (HIDE_SYMBOL_FLAGS "-fno-visibility-inlines-hidden -fvisibility=hidden")
+     set (QPID_LINKMAP ${CMAKE_CURRENT_SOURCE_DIR}/qpid.linkmap)
+     set (LINK_VERSION_SCRIPT_FLAG "-Wl,--version-script=${QPID_LINKMAP}")
    endif (GCC_VERSION VERSION_EQUAL 4.1.2)
 endif (CMAKE_COMPILER_IS_GNUCXX)
-
-if (CMAKE_SYSTEM_NAME STREQUAL Linux)
-  set (QPID_LINKMAP ${CMAKE_CURRENT_SOURCE_DIR}/qpid.linkmap)
-  set (LINK_VERSION_SCRIPT_FLAG "-Wl,--version-script=${QPID_LINKMAP}")
-endif (CMAKE_SYSTEM_NAME STREQUAL Linux)
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL SunPro)
   set (COMPILER_FLAGS "-library=stlport4 -mt")
@@ -381,7 +383,7 @@ if (NOT CMAKE_SYSTEM_NAME STREQUAL Windows)
   endif (NOT CLOCK_GETTIME_IN_LIBC)
 
   # Ensure we have uuid library
-  CHECK_LIBRARY_EXISTS (uuid uuid_compare "" HAVE_UUID)
+  CHECK_LIBRARY_EXISTS (uuid uuid_generate "" HAVE_UUID)
   CHECK_INCLUDE_FILES(uuid/uuid.h HAVE_UUID_H)
   if (NOT HAVE_UUID AND NOT HAVE_UUID_H)
     message(FATAL_ERROR "Uuid library and/or header file not found")
@@ -389,14 +391,19 @@ if (NOT CMAKE_SYSTEM_NAME STREQUAL Windows)
   set (uuid_LIB "uuid")
 
   # Check for header file for dtrace static probes
-  check_include_files(sys/sdt.h HAVE_SYS_SDT_H)
-  if (HAVE_SYS_SDT_H)
-  set(probes_default ON)
-  endif (HAVE_SYS_SDT_H)
-  option(BUILD_PROBES "Build with DTrace/systemtap static probes" ${probes_default})
-  if (NOT BUILD_PROBES)
-  set (HAVE_SYS_SDT_H 0)
-  endif (NOT BUILD_PROBES)
+  check_include_files(sys/sdt.h HAVE_SDT)
+  if (HAVE_SDT)
+    # Only enable by default on Linux
+    if (CMAKE_SYSTEM_NAME STREQUAL Linux)
+    set(probes_default ON)
+    endif (CMAKE_SYSTEM_NAME STREQUAL Linux)
+    option(BUILD_PROBES "Build with DTrace/systemtap static probes" "${probes_default}")
+  endif (HAVE_SDT)
+  if (BUILD_PROBES)
+    set (HAVE_SYS_SDT_H 1)
+  else (HAVE_SDT)
+    set (HAVE_SYS_SDT_H 0)
+  endif (BUILD_PROBES)
 
   # Check for poll/epoll header files
   check_include_files(sys/poll.h HAVE_POLL)
@@ -453,6 +460,8 @@ if (BUILD_SSL)
   if (CMAKE_SYSTEM_NAME STREQUAL Windows)
     set (sslcommon_SOURCES
          qpid/sys/windows/SslAsynchIO.cpp
+         qpid/sys/windows/SslCredential.cpp
+         qpid/sys/windows/SslCredential.h
          qpid/sys/windows/util.cpp
          qpid/sys/windows/util.h
     )
@@ -584,7 +593,6 @@ option(BUILD_HA "Build Active-Passive HA plugin" ${ha_default})
 if (BUILD_HA)
     set (ha_SOURCES
 	qpid/ha/QueueSnapshot.h
-	qpid/ha/QueueSnapshots.h
         qpid/ha/AlternateExchangeSetter.h
         qpid/ha/Backup.cpp
         qpid/ha/Backup.h
@@ -608,6 +616,7 @@ if (BUILD_HA)
         qpid/ha/Membership.h
         qpid/ha/Primary.cpp
         qpid/ha/Primary.h
+        qpid/ha/PrimaryQueueLimits.h
         qpid/ha/QueueGuard.cpp
         qpid/ha/QueueGuard.h
         qpid/ha/QueueReplicator.cpp
@@ -672,6 +681,7 @@ if (CMAKE_SYSTEM_NAME STREQUAL Windows)
   set (qpidcommon_platform_SOURCES
     qpid/log/windows/SinkOptions.cpp
     qpid/sys/windows/AsynchIO.cpp
+    qpid/sys/windows/Path.cpp
     qpid/sys/windows/FileSysDir.cpp
     qpid/sys/windows/IocpPoller.cpp
     qpid/sys/windows/IOHandle.cpp
@@ -766,6 +776,7 @@ else (CMAKE_SYSTEM_NAME STREQUAL Windows)
   set (qpidcommon_platform_SOURCES
     qpid/sys/posix/AsynchIO.cpp
     qpid/sys/posix/Fork.cpp
+    qpid/sys/posix/Path.cpp
     qpid/sys/posix/FileSysDir.cpp
     qpid/sys/posix/IOHandle.cpp
     qpid/sys/posix/LockFile.cpp
@@ -1003,7 +1014,7 @@ add_msvc_version (qpidclient library dll)
 
 add_library (qpidclient SHARED ${qpidclient_SOURCES})
 
-target_link_libraries (qpidclient qpidcommon
+target_link_libraries (qpidclient qpidcommon qpidtypes
                        ${Boost_PROGRAM_OPTIONS_LIBRARY}
                        ${ssl_LIBS})
 
@@ -1054,6 +1065,7 @@ set (qpidmessaging_SOURCES
      qpid/messaging/Duration.cpp
      qpid/messaging/exceptions.cpp
      qpid/messaging/FailoverUpdates.cpp
+     qpid/messaging/Logger.cpp
      qpid/messaging/Message.cpp
      qpid/messaging/Receiver.cpp
      qpid/messaging/Session.cpp
@@ -1063,6 +1075,7 @@ set (qpidmessaging_SOURCES
      qpid/messaging/ConnectionOptions.cpp
      qpid/messaging/MessageImpl.h
      qpid/messaging/MessageImpl.cpp
+     qpid/messaging/Message_io.cpp
      qpid/messaging/ProtocolRegistry.cpp
      qpid/messaging/amqp/EncodedMessage.h
      qpid/messaging/amqp/EncodedMessage.cpp
@@ -1071,7 +1084,7 @@ set (qpidmessaging_SOURCES
 add_msvc_version (qpidmessaging library dll)
 
 add_library (qpidmessaging SHARED ${qpidmessaging_SOURCES})
-target_link_libraries (qpidmessaging qpidtypes qpidclient qpidcommon ${PROTON_LIBRARIES})
+target_link_libraries (qpidmessaging qpidtypes qpidclient qpidcommon "${Boost_PROGRAM_OPTIONS_LIBRARY}" ${Proton_LIBRARIES})
 set_target_properties (qpidmessaging PROPERTIES
                        LINK_FLAGS "${HIDE_SYMBOL_FLAGS} ${LINK_VERSION_SCRIPT_FLAG}"
                        COMPILE_FLAGS "${HIDE_SYMBOL_FLAGS}"
@@ -1360,7 +1373,7 @@ set (prefix ${CMAKE_INSTALL_PREFIX})
 set (exec_prefix ${CMAKE_INSTALL_PREFIX})
 set_absolute_install_path (libdir ${QPID_INSTALL_LIBDIR})
 set_absolute_install_path (includedir ${QPID_INSTALL_INCLUDEDIR})
-set (VERSION ${QPID_VERSION})
+set (VERSION ${QPID_VERSION_FULL})
 
 #add_custom_target(pkgconfig ALL echo DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/qpid.pc)
 #add_dependencies(pkgconfig ${CMAKE_CURRENT_BINARY_DIR}/qmf2.pc)
@@ -1368,4 +1381,24 @@ configure_file(qpid.pc.in ${CMAKE_CURRENT_BINARY_DIR}/qpid.pc @ONLY)
 configure_file(qmf2.pc.in ${CMAKE_CURRENT_BINARY_DIR}/qmf2.pc @ONLY)
 install (FILES ${CMAKE_CURRENT_BINARY_DIR}/qpid.pc ${CMAKE_CURRENT_BINARY_DIR}/qmf2.pc
          DESTINATION ${QPID_INSTALL_LIBDIR}/pkgconfig
+         COMPONENT ${QPID_COMPONENT_COMMON})
+
+if (DEFINED CMAKE_IMPORT_LIBRARY_PREFIX)
+set(QPIDMSGLIB ${CMAKE_IMPORT_LIBRARY_PREFIX}qpidmessaging${CMAKE_IMPORT_LIBRARY_SUFFIX})
+set(QPIDMSGLIBDEBUG ${CMAKE_IMPORT_LIBRARY_PREFIX}qpidmessaging${CMAKE_DEBUG_POSTFIX}${CMAKE_IMPORT_LIBRARY_SUFFIX})
+set(QPIDTYPESLIB ${CMAKE_IMPORT_LIBRARY_PREFIX}qpidtypes${CMAKE_IMPORT_LIBRARY_SUFFIX})
+set(QPIDTYPESLIBDEBUG ${CMAKE_IMPORT_LIBRARY_PREFIX}qpidtypes${CMAKE_DEBUG_POSTFIX}${CMAKE_IMPORT_LIBRARY_SUFFIX})
+else ()
+set(QPIDMSGLIB ${CMAKE_SHARED_LIBRARY_PREFIX}qpidmessaging${CMAKE_SHARED_LIBRARY_SUFFIX})
+set(QPIDMSGLIBDEBUG ${CMAKE_SHARED_LIBRARY_PREFIX}qpidmessaging${CMAKE_DEBUG_POSTFIX}${CMAKE_SHARED_LIBRARY_SUFFIX})
+set(QPIDTYPESLIB ${CMAKE_SHARED_LIBRARY_PREFIX}qpidtypes${CMAKE_SHARED_LIBRARY_SUFFIX})
+set(QPIDTYPESLIBDEBUG ${CMAKE_SHARED_LIBRARY_PREFIX}qpidtypes${CMAKE_DEBUG_POSTFIX}${CMAKE_SHARED_LIBRARY_SUFFIX})
+endif ()
+
+configure_file(QpidConfig.cmake.in ${CMAKE_CURRENT_BINARY_DIR}/QpidConfig.cmake @ONLY)
+configure_file(QpidConfigVersion.cmake.in ${CMAKE_CURRENT_BINARY_DIR}/QpidConfigVersion.cmake @ONLY)
+install (FILES
+         ${CMAKE_CURRENT_BINARY_DIR}/QpidConfig.cmake
+         ${CMAKE_CURRENT_BINARY_DIR}/QpidConfigVersion.cmake
+         DESTINATION ${QPID_INSTALL_LIBDIR}/cmake/Qpid
          COMPONENT ${QPID_COMPONENT_COMMON})

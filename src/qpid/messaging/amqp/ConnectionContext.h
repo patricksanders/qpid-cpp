@@ -45,6 +45,7 @@ namespace framing {
 class ProtocolVersion;
 }
 namespace sys {
+class SecurityLayer;
 struct SecuritySettings;
 }
 namespace messaging {
@@ -83,6 +84,8 @@ class ConnectionContext : public qpid::sys::ConnectionCodec, public qpid::messag
     bool get(boost::shared_ptr<SessionContext> ssn, boost::shared_ptr<ReceiverContext> lnk, qpid::messaging::Message& message, qpid::messaging::Duration timeout);
     void acknowledge(boost::shared_ptr<SessionContext> ssn, qpid::messaging::Message* message, bool cumulative);
     void nack(boost::shared_ptr<SessionContext> ssn, qpid::messaging::Message& message, bool reject);
+    void sync(boost::shared_ptr<SessionContext> ssn);
+    boost::shared_ptr<ReceiverContext> nextReceiver(boost::shared_ptr<SessionContext> ssn, qpid::messaging::Duration timeout);
 
     void setOption(const std::string& name, const qpid::types::Variant& value);
     std::string getAuthenticatedUsername();
@@ -99,6 +102,7 @@ class ConnectionContext : public qpid::sys::ConnectionCodec, public qpid::messag
 
     void activateOutput();
     qpid::sys::Codec& getCodec();
+    const qpid::messaging::ConnectionOptions* getOptions();
     //ConnectionCodec interface:
     std::size_t decode(const char* buffer, std::size_t size);
     std::size_t encode(char* buffer, std::size_t size);
@@ -112,9 +116,24 @@ class ConnectionContext : public qpid::sys::ConnectionCodec, public qpid::messag
     void reconnect();
     std::string getUrl() const;
     const qpid::sys::SecuritySettings* getTransportSecuritySettings();
+    void initSecurityLayer(qpid::sys::SecurityLayer&);
+    void trace(const char*) const;
 
   private:
     typedef std::map<std::string, boost::shared_ptr<SessionContext> > SessionMap;
+    class CodecAdapter : public qpid::sys::Codec
+    {
+      public:
+        CodecAdapter(ConnectionContext&);
+        std::size_t decode(const char* buffer, std::size_t size);
+        std::size_t encode(char* buffer, std::size_t size);
+        bool canEncode();
+      private:
+        ConnectionContext& context;
+    };
+
+    Url fullUrl;                // Combined URL of all known addresses.
+    Url currentUrl;             // URL of currently connected address.
 
     boost::shared_ptr<DriverImpl> driver;
     boost::shared_ptr<Transport> transport;
@@ -127,15 +146,17 @@ class ConnectionContext : public qpid::sys::ConnectionCodec, public qpid::messag
     bool readHeader;
     bool haveOutput;
     std::string id;
-    std::string currentUrl;
     enum {
         DISCONNECTED,
         CONNECTING,
         CONNECTED
     } state;
     std::auto_ptr<Sasl> sasl;
+    CodecAdapter codecAdapter;
 
     void check();
+    bool checkDisconnected();
+    void waitNoReconnect();
     void wait();
     void waitUntil(qpid::sys::AbsTime until);
     void wait(boost::shared_ptr<SessionContext>);
@@ -151,13 +172,13 @@ class ConnectionContext : public qpid::sys::ConnectionCodec, public qpid::messag
     void wakeupDriver();
     void attach(boost::shared_ptr<SessionContext>, pn_link_t*, int credit=0);
     void autoconnect();
-    bool tryConnect();
-    bool tryConnect(const qpid::Url& url);
-    bool tryConnect(const qpid::Address& address);
+    bool tryConnectUrl(const qpid::Url& url);
+    bool tryOpenAddr(const qpid::Address& address);
+    bool tryConnectAddr(const qpid::Address& address);
+    void reconnect(const Url& url);
     void reset();
     bool restartSessions();
     void restartSession(boost::shared_ptr<SessionContext>);
-    void setCurrentUrl(const qpid::Address&);
 
     std::size_t decodePlain(const char* buffer, std::size_t size);
     std::size_t encodePlain(char* buffer, std::size_t size);

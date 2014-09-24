@@ -204,13 +204,13 @@ Exchange::Exchange(const string& _name, bool _durable, bool _autodelete, const q
         }
     }
 
-    sequence = _args.get(qpidMsgSequence);
+    sequence = !!_args.get(qpidMsgSequence);
     if (sequence) {
         QPID_LOG(debug, "Configured exchange " <<  _name  << " with Msg sequencing");
         args.setInt64(std::string(qpidSequenceCounter), sequenceNo);
     }
 
-    ive = _args.get(qpidIVE);
+    ive = !!_args.get(qpidIVE);
     if (ive) {
         QPID_LOG(debug, "Configured exchange " <<  _name  << " with Initial Value");
     }
@@ -444,12 +444,18 @@ void Exchange::incOtherUsers()
     Mutex::ScopedLock l(usersLock);
     otherUsers++;
 }
-void Exchange::decOtherUsers()
+void Exchange::decOtherUsers(bool isControllingLink=false)
 {
     Mutex::ScopedLock l(usersLock);
     assert(otherUsers);
     if (otherUsers) otherUsers--;
-    if (!inUse() && !hasBindings()) checkAutodelete();
+    if (autodelete) {
+        if (isControllingLink) {
+            if (broker) broker->getExchanges().destroy(name);
+        } else if (!inUse() && !hasBindings()) {
+            checkAutodelete();
+        }
+    }
 }
 bool Exchange::inUse() const
 {
@@ -476,7 +482,7 @@ void Exchange::destroy()
         deletionListeners.swap(copy);
     }
     for (std::map<std::string, boost::function0<void> >::iterator i = copy.begin(); i != copy.end(); ++i) {
-        QPID_LOG(notice, "Exchange::destroy() notifying " << i->first);
+        QPID_LOG(debug, "Exchange::destroy() notifying " << i->first);
         if (i->second) i->second();
     }
 }
@@ -484,6 +490,10 @@ bool Exchange::isDestroyed() const
 {
     Mutex::ScopedLock l(usersLock);
     return destroyed;
+}
+bool Exchange::isAutoDelete() const
+{
+    return autodelete;
 }
 
 }}

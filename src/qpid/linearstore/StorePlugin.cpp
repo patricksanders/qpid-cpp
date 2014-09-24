@@ -25,6 +25,7 @@
 #include "qpid/DataDir.h"
 #include "qpid/linearstore/JournalLogImpl.h"
 #include "qpid/linearstore/MessageStoreImpl.h"
+#include "qpid/log/Statement.h"
 
 using qpid::linearstore::MessageStoreImpl;
 
@@ -45,7 +46,7 @@ struct StorePlugin : public Plugin {
         Broker* broker = dynamic_cast<Broker*>(&target);
         if (!broker) return;
         store.reset(new MessageStoreImpl(broker));
-        DataDir& dataDir = broker->getDataDir ();
+        const DataDir& dataDir = broker->getDataDir ();
         if (options.storeDir.empty ())
         {
             if (!dataDir.isEnabled ())

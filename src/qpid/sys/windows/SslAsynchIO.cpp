@@ -85,8 +85,10 @@ SslAsynchIO::SslAsynchIO(const qpid::sys::Socket& s,
     readCallback(rCb),
     idleCallback(iCb),
     negotiateDoneCallback(nCb),
-    callbacksInProgress(0),
     queuedDelete(false),
+    queuedClose(false),
+    reapCheckPending(false),
+    started(false),
     leftoverPlaintext(0)
 {
     SecInvalidateHandle(&ctxtHandle);
@@ -105,16 +107,38 @@ SslAsynchIO::~SslAsynchIO() {
 }
 
 void SslAsynchIO::queueForDeletion() {
+    // Called exactly once, always on the IO completion thread.
+    bool authenticated = (state != Negotiating);
+    state = ShuttingDown;
+    if (authenticated) {
+        // Tell SChannel we are done.
+        DWORD shutdown = SCHANNEL_SHUTDOWN;
+        SecBuffer shutBuff;
+        shutBuff.cbBuffer = sizeof(DWORD);
+        shutBuff.BufferType = SECBUFFER_TOKEN;
+        shutBuff.pvBuffer = &shutdown;
+        SecBufferDesc desc;
+        desc.ulVersion = SECBUFFER_VERSION;
+        desc.cBuffers = 1;
+        desc.pBuffers = &shutBuff;
+        ::ApplyControlToken(&ctxtHandle, &desc);
+        negotiateStep(0);
+    }
+
+    queueWriteClose();
+    queuedDelete = true;
+
     // This method effectively disconnects the layer above; pass it on the
     // AsynchIO and delete.
     aio->queueForDeletion();
-    queuedDelete = true;
-    if (!callbacksInProgress)
-        delete this;
+
+    if (!reapCheckPending)
+        delete(this);
 }
 
 void SslAsynchIO::start(qpid::sys::Poller::shared_ptr poller) {
     aio->start(poller);
+    started = true;
     startNegotiate();
 }
 
@@ -182,28 +206,23 @@ void SslAsynchIO::notifyPendingWrite() {
 }
 
 void SslAsynchIO::queueWriteClose() {
-    if (state == Negotiating) {
-        // Never got going, so don't bother trying to close SSL down orderly.
-        state = ShuttingDown;
-        aio->queueWriteClose();
+    qpid::sys::Mutex::ScopedLock l(lock);
+    if (queuedClose)
         return;
+    queuedClose = true;
+    if (started) {
+        reapCheckPending = true;
+        // Move tear down logic to an IO thread.
+        aio->requestCallback(boost::bind(&SslAsynchIO::reapCheck, this));
     }
+    aio->queueWriteClose();
+}
 
-    state = ShuttingDown;
-
-    DWORD shutdown = SCHANNEL_SHUTDOWN;
-    SecBuffer shutBuff;
-    shutBuff.cbBuffer = sizeof(DWORD);
-    shutBuff.BufferType = SECBUFFER_TOKEN;
-    shutBuff.pvBuffer = &shutdown;
-    SecBufferDesc desc;
-    desc.ulVersion = SECBUFFER_VERSION;
-    desc.cBuffers = 1;
-    desc.pBuffers = &shutBuff;
-    ::ApplyControlToken(&ctxtHandle, &desc);
-    negotiateStep(0);
-    // When the shutdown sequence is done, negotiateDone() will handle
-    // shutting down aio.
+void SslAsynchIO::reapCheck() {
+    // Serialized check in the IO thread whether to self-delete.
+    reapCheckPending = false;
+    if (queuedDelete)
+        delete(this);
 }
 
 bool SslAsynchIO::writeQueueEmpty() {
@@ -255,7 +274,6 @@ void SslAsynchIO::negotiationDone() {
         state = Running;
         break;
     case ShuttingDown:
-        aio->queueWriteClose();
         break;
     default:
         assert(0);
@@ -272,6 +290,9 @@ void SslAsynchIO::negotiationFailed(SECURITY_STATUS status) {
 }
 
 void SslAsynchIO::sslDataIn(qpid::sys::AsynchIO& a, BufferBase *buff) {
+    if (state == ShuttingDown) {
+        return;
+    }
     if (state != Running) {
         negotiateStep(buff);
         return;
@@ -394,9 +415,7 @@ void SslAsynchIO::sslDataIn(qpid::sys::AsynchIO& a, BufferBase *buff) {
         if (readCallback) {
             // The callback guard here is to prevent an upcall from deleting
             // this out from under us via queueForDeletion().
-            ++callbacksInProgress;
             readCallback(*this, temp);
-            --callbacksInProgress;
         }
         else
             a.queueReadBuffer(temp); // What else can we do with this???
@@ -406,11 +425,6 @@ void SslAsynchIO::sslDataIn(qpid::sys::AsynchIO& a, BufferBase *buff) {
     // go back and handle that.
     if (extraBuff != 0)
         sslDataIn(a, extraBuff);
-
-    // If the upper layer queued for delete, do that now that all the
-    // callbacks are done.
-    if (queuedDelete && callbacksInProgress == 0)
-        delete this;
 }
 
 void SslAsynchIO::idle(qpid::sys::AsynchIO&) {
@@ -435,7 +449,7 @@ ClientSslAsynchIO::ClientSslAsynchIO(const std::string& brokerHost,
                                      IdleCallback iCb,
                                      NegotiateDoneCallback nCb) :
     SslAsynchIO(s, hCred, rCb, eofCb, disCb, cCb, eCb, iCb, nCb),
-    serverHost(brokerHost)
+    serverHost(brokerHost), clientCertRequested(false)
 {
 }
 
@@ -445,7 +459,7 @@ void ClientSslAsynchIO::startNegotiate() {
 
     // Need a buffer to receive the token to send to the server.
     BufferBase *buff = aio->getQueuedBuffer();
-    ULONG ctxtRequested = ISC_REQ_STREAM;
+    ULONG ctxtRequested = ISC_REQ_STREAM | ISC_REQ_USE_SUPPLIED_CREDS;
     ULONG ctxtAttrs;
     // sendBuffs gets information to forward to the peer.
     SecBuffer sendBuffs[2];
@@ -471,6 +485,7 @@ void ClientSslAsynchIO::startNegotiate() {
                                                          &sendBuffDesc,
                                                          &ctxtAttrs,
                                                          NULL);
+
     if (status == SEC_I_CONTINUE_NEEDED) {
         buff->dataCount = sendBuffs[0].cbBuffer;
         aio->queueWrite(buff);
@@ -480,7 +495,7 @@ void ClientSslAsynchIO::startNegotiate() {
 void ClientSslAsynchIO::negotiateStep(BufferBase* buff) {
     // SEC_CHAR is non-const, so do all the typing here.
     SEC_CHAR *host = const_cast<SEC_CHAR *>(serverHost.c_str());
-    ULONG ctxtRequested = ISC_REQ_STREAM;
+    ULONG ctxtRequested = ISC_REQ_STREAM | ISC_REQ_USE_SUPPLIED_CREDS;
     ULONG ctxtAttrs;
 
     // tokenBuffs describe the buffer that's coming in. It should have
@@ -535,6 +550,17 @@ void ClientSslAsynchIO::negotiateStep(BufferBase* buff) {
     if (buff)
         aio->queueReadBuffer(buff);
     if (status == SEC_I_CONTINUE_NEEDED) {
+        // check if server has requested a client certificate
+        if (!clientCertRequested) {
+            SecPkgContext_IssuerListInfoEx caList;
+            memset(&caList, 0, sizeof(caList));
+            ::QueryContextAttributes(&ctxtHandle, SECPKG_ATTR_ISSUER_LIST_EX, &caList);
+            if (caList.cIssuers > 0)
+                clientCertRequested = true;
+            if (caList.aIssuers)
+                ::FreeContextBuffer(caList.aIssuers);
+        }
+
         sendbuff->dataCount = sendBuffs[0].cbBuffer;
         aio->queueWrite(sendbuff);
         return;
@@ -545,8 +571,13 @@ void ClientSslAsynchIO::negotiateStep(BufferBase* buff) {
     // either session stop or negotiation done (session up).
     if (status == SEC_E_OK || status == SEC_I_CONTEXT_EXPIRED)
         negotiationDone();
-    else
+    else {
+        if (clientCertRequested && status == SEC_E_CERT_UNKNOWN)
+            // ISC_REQ_USE_SUPPLIED_CREDS makes us reponsible for this case
+            // (no client cert).  Map it to its counterpart:
+            status = SEC_E_INCOMPLETE_CREDENTIALS;
         negotiationFailed(status);
+    }
 }
 
 /*************************************************/
@@ -630,7 +661,7 @@ void ServerSslAsynchIO::negotiateStep(BufferBase* buff) {
         return;
     }
     // There may have been a token generated; if so, send it to the client.
-    if (sendBuffs[0].cbBuffer > 0) {
+    if (sendBuffs[0].cbBuffer > 0 && state != ShuttingDown) {
         sendbuff->dataCount = sendBuffs[0].cbBuffer;
         aio->queueWrite(sendbuff);
     }

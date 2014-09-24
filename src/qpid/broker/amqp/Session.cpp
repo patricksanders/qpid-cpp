@@ -185,24 +185,26 @@ class IncomingToQueue : public DecodingIncoming
 class IncomingToExchange : public DecodingIncoming
 {
   public:
-    IncomingToExchange(Broker& b, Session& p, boost::shared_ptr<qpid::broker::Exchange> e, pn_link_t* l, const std::string& source)
-        : DecodingIncoming(l, b, p, source, e->getName(), pn_link_name(l)), exchange(e), authorise(p.getAuthorise())
+    IncomingToExchange(Broker& b, Session& p, boost::shared_ptr<qpid::broker::Exchange> e, pn_link_t* l, const std::string& source, bool icl)
+        : DecodingIncoming(l, b, p, source, e->getName(), pn_link_name(l)), exchange(e), authorise(p.getAuthorise()), isControllingLink(icl)
     {
         exchange->incOtherUsers();
     }
     ~IncomingToExchange()
     {
-        exchange->decOtherUsers();
+        exchange->decOtherUsers(isControllingLink);
     }
     void handle(qpid::broker::Message& m);
   private:
     boost::shared_ptr<qpid::broker::Exchange> exchange;
     Authorise& authorise;
+    bool isControllingLink;
 };
 
 Session::Session(pn_session_t* s, Connection& c, qpid::sys::OutputControl& o)
     : ManagedSession(c.getBroker(), c, (boost::format("%1%") % s).str()), session(s), connection(c), out(o), deleted(false),
-      authorise(connection.getUserId(), connection.getBroker().getAcl()) {}
+      authorise(connection.getUserId(), connection.getBroker().getAcl()),
+      detachRequested() {}
 
 
 Session::ResolvedNode Session::resolve(const std::string name, pn_terminus_t* terminus, bool incoming)
@@ -234,7 +236,7 @@ Session::ResolvedNode Session::resolve(const std::string name, pn_terminus_t* te
     node.properties.read(pn_terminus_properties(terminus));
 
     if (node.exchange && createOnDemand && isTopicRequested) {
-        if (!node.properties.getExchangeType().empty() && node.properties.getExchangeType() != node.exchange->getType()) {
+        if (!node.properties.getSpecifiedExchangeType().empty() && node.properties.getExchangeType() != node.exchange->getType()) {
             //emulate 0-10 exchange-declare behaviour
             throw Exception(qpid::amqp::error_conditions::PRECONDITION_FAILED, "Exchange of different type already exists");
         }
@@ -251,14 +253,20 @@ Session::ResolvedNode Session::resolve(const std::string name, pn_terminus_t* te
                 }
                 qpid::framing::FieldTable args;
                 qpid::amqp_0_10::translate(node.properties.getProperties(), args);
-                node.exchange = connection.getBroker().createExchange(name, node.properties.getExchangeType(), node.properties.isDurable(), node.properties.isAutodelete(),
-                                                                      node.properties.getAlternateExchange(),
-                                                                      args, connection.getUserId(), connection.getId()).first;
+                std::pair<boost::shared_ptr<Exchange>, bool> result
+                    = connection.getBroker().createExchange(name, node.properties.getExchangeType(), node.properties.isDurable(), node.properties.isAutodelete(),
+                                                            node.properties.getAlternateExchange(),
+                                                            args, connection.getUserId(), connection.getId());
+                node.exchange = result.first;
+                node.created = result.second;
             } else {
                 if (node.exchange) {
                     QPID_LOG_CAT(warning, model, "Node name will be ambiguous, creation of queue named " << name << " requested when exchange of the same name already exists");
                 }
-                node.queue = connection.getBroker().createQueue(name, node.properties.getQueueSettings(), this, node.properties.getAlternateExchange(), connection.getUserId(), connection.getId()).first;
+                std::pair<boost::shared_ptr<Queue>, bool> result
+                    = connection.getBroker().createQueue(name, node.properties.getQueueSettings(), this, node.properties.getAlternateExchange(), connection.getUserId(), connection.getId());
+                node.queue = result.first;
+                node.created = result.second;
             }
         } else {
             boost::shared_ptr<NodePolicy> nodePolicy = connection.getNodePolicies().match(name);
@@ -415,10 +423,10 @@ void Session::setupIncoming(pn_link_t* link, pn_terminus_t* target, const std::s
         source = sourceAddress;
     }
     if (node.queue) {
-        boost::shared_ptr<Incoming> q(new IncomingToQueue(connection.getBroker(), *this, node.queue, link, source, node.properties.trackControllingLink()));
+        boost::shared_ptr<Incoming> q(new IncomingToQueue(connection.getBroker(), *this, node.queue, link, source, node.created && node.properties.trackControllingLink()));
         incoming[link] = q;
     } else if (node.exchange) {
-        boost::shared_ptr<Incoming> e(new IncomingToExchange(connection.getBroker(), *this, node.exchange, link, source));
+        boost::shared_ptr<Incoming> e(new IncomingToExchange(connection.getBroker(), *this, node.exchange, link, source, node.created && node.properties.trackControllingLink()));
         incoming[link] = e;
     } else if (node.relay) {
         boost::shared_ptr<Incoming> in(new IncomingToRelay(link, connection.getBroker(), *this, source, name, pn_link_name(link), node.relay));
@@ -460,7 +468,7 @@ void Session::setupOutgoing(pn_link_t* link, pn_terminus_t* source, const std::s
         if (type == CONSUMER && node.queue->hasExclusiveOwner() && !node.queue->isExclusiveOwner(this)) {
             throw Exception(qpid::amqp::error_conditions::PRECONDITION_FAILED, std::string("Cannot consume from exclusive queue ") + node.queue->getName());
         }
-        boost::shared_ptr<Outgoing> q(new OutgoingFromQueue(connection.getBroker(), name, target, node.queue, link, *this, out, type, false, node.properties.trackControllingLink()));
+        boost::shared_ptr<Outgoing> q(new OutgoingFromQueue(connection.getBroker(), name, target, node.queue, link, *this, out, type, false, node.created && node.properties.trackControllingLink()));
         q->init();
         filter.apply(q);
         outgoing[link] = q;
@@ -474,7 +482,8 @@ void Session::setupOutgoing(pn_link_t* link, pn_terminus_t* source, const std::s
         if (node.topic) {
             settings = node.topic->getPolicy();
             settings.durable = durable;
-            settings.autodelete = autodelete;
+            //only determine autodelete from link details if the policy did not imply autodeletion
+            if (!settings.autodelete) settings.autodelete = autodelete;
             altExchange = node.topic->getAlternateExchange();
         }
         settings.autoDeleteDelay = pn_terminus_get_timeout(source);
@@ -682,6 +691,17 @@ Authorise& Session::getAuthorise()
     return authorise;
 }
 
+bool Session::endedByManagement() const
+{
+    return detachRequested;
+}
+
+void Session::detachedByManagement()
+{
+    detachRequested = true;
+    wakeup();
+}
+
 void IncomingToQueue::handle(qpid::broker::Message& message)
 {
     if (queue->isDeleted()) {
@@ -698,6 +718,8 @@ void IncomingToQueue::handle(qpid::broker::Message& message)
 
 void IncomingToExchange::handle(qpid::broker::Message& message)
 {
+    if (exchange->isDestroyed())
+        throw qpid::framing::ResourceDeletedException(QPID_MSG("Exchange " << exchange->getName() << " has been deleted."));
     authorise.route(exchange, message);
     DeliverableMessage deliverable(message, 0);
     exchange->route(deliverable);

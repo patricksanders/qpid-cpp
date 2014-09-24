@@ -30,7 +30,6 @@
 #include "qpid/amqp_0_10/Codecs.h"
 #include "qpid/broker/Bridge.h"
 #include "qpid/broker/Broker.h"
-#include "qpid/broker/SessionHandler.h"
 #include "qpid/broker/Link.h"
 #include "qpid/framing/AMQP_ServerProxy.h"
 #include "qpid/framing/AMQFrame.h"
@@ -64,19 +63,16 @@ void Backup::setBrokerUrl(const Url& brokers) {
         QPID_LOG(info, logPrefix << "Connecting to cluster, broker URL: " << brokers);
         string protocol = brokers[0].protocol.empty() ? "tcp" : brokers[0].protocol;
         types::Uuid uuid(true);
-        std::pair<Link::shared_ptr, bool> result;
-        result = broker.getLinks().declare(
+        link = broker.getLinks().declare(
             broker::QPID_NAME_PREFIX + string("ha.link.") + uuid.str(),
             brokers[0].host, brokers[0].port, protocol,
             false,                  // durable
             settings.mechanism, settings.username, settings.password,
-            false);               // no amq.failover - don't want to use client URL.
-        link = result.first;
-        replicator.reset(new BrokerReplicator(haBroker, link));
-        replicator->initialize();
+            false).first;     // no amq.failover - don't want to use client URL.
+        replicator = BrokerReplicator::create(haBroker, link);
         broker.getExchanges().registerExchange(replicator);
     }
-    link->setUrl(brokers);          // Outside the lock, once set link doesn't change.
+    link->setUrl(brokers);
 }
 
 void Backup::stop(Mutex::ScopedLock&) {
@@ -96,12 +92,11 @@ Role* Backup::recover(Mutex::ScopedLock&) {
         Mutex::ScopedLock l(lock);
         if (stopped) return 0;
         stop(l);                 // Stop backup activity before starting primary.
-        QPID_LOG(notice, "Promoting to primary: " << haBroker.getBrokerInfo());
         // Reset membership before allowing backups to connect.
         backups = membership.otherBackups();
         membership.clear();
-        return new Primary(haBroker, backups);
     }
+    return new Primary(haBroker, backups);
 }
 
 Role* Backup::promote() {

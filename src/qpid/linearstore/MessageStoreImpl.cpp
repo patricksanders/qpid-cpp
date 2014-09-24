@@ -21,27 +21,28 @@
 
 #include "qpid/linearstore/MessageStoreImpl.h"
 
-#include "db-inc.h"
-#include "qpid/broker/QueueSettings.h"
+#include "qpid/broker/Broker.h"
+#include "qpid/framing/FieldValue.h"
 #include "qpid/linearstore/BindingDbt.h"
 #include "qpid/linearstore/BufferValue.h"
+#include "qpid/linearstore/Cursor.h"
+#include "qpid/linearstore/DataTokenImpl.h"
 #include "qpid/linearstore/IdDbt.h"
-#include "qpid/linearstore/jrnl/EmptyFilePoolManager.h"
-#include "qpid/linearstore/jrnl/txn_map.h"
-#include "qpid/framing/FieldValue.h"
-#include "qmf/org/apache/qpid/linearstore/Package.h"
+#include "qpid/linearstore/JournalImpl.h"
+#include "qpid/linearstore/journal/EmptyFilePoolManager.h"
 #include "qpid/linearstore/StoreException.h"
-#include <dirent.h>
+#include "qpid/linearstore/TxnCtxt.h"
+#include "qpid/log/Statement.h"
 
+#include "qmf/org/apache/qpid/linearstore/Package.h"
 
 #define MAX_AIO_SLEEPS 100000 // tot: ~1 sec
 #define AIO_SLEEP_TIME_US  10 // 0.01 ms
 
-namespace _qmf = qmf::org::apache::qpid::linearstore;
+//namespace _qmf = qmf::org::apache::qpid::linearstore;
 
 namespace qpid{
 namespace linearstore{
-
 
 const std::string MessageStoreImpl::storeTopLevelDir("qls"); // Sets the top-level store dir name
 
@@ -49,16 +50,6 @@ const std::string MessageStoreImpl::storeTopLevelDir("qls"); // Sets the top-lev
 qpid::sys::Duration MessageStoreImpl::defJournalGetEventsTimeout(1 * qpid::sys::TIME_MSEC); // 10ms
 qpid::sys::Duration MessageStoreImpl::defJournalFlushTimeout(500 * qpid::sys::TIME_MSEC); // 0.5s
 qpid::sys::Mutex TxnCtxt::globalSerialiser;
-
-MessageStoreImpl::TplRecoverStruct::TplRecoverStruct(const uint64_t rid_,
-                                                     const bool deq_flag_,
-                                                     const bool commit_flag_,
-                                                     const bool tpc_flag_) :
-                                                     rid(rid_),
-                                                     deq_flag(deq_flag_),
-                                                     commit_flag(commit_flag_),
-                                                     tpc_flag(tpc_flag_)
-{}
 
 MessageStoreImpl::MessageStoreImpl(qpid::broker::Broker* broker_, const char* envpath_) :
                                    defaultEfpPartitionNumber(0),
@@ -72,10 +63,16 @@ MessageStoreImpl::MessageStoreImpl(qpid::broker::Broker* broker_, const char* en
                                    isInit(false),
                                    envPath(envpath_),
                                    broker(broker_),
-                                   jrnlLog(qpid::qls_jrnl::JournalLog::LOG_NOTICE),
+                                   jrnlLog(qpid::linearstore::journal::JournalLog::LOG_NOTICE),
                                    mgmtObject(),
                                    agent(0)
-{}
+{
+    // Test of values for QLS_RAND_SHIFT1, QLS_RAND_SHIFT2 and QLS_RAND_MASK
+    if((((uint64_t)RAND_MAX << QLS_RAND_SHIFT1) ^ ((uint64_t)RAND_MAX << QLS_RAND_SHIFT2) ^ (RAND_MAX & QLS_RAND_MASK)) != 0xffffffffffffffffULL) {
+        THROW_STORE_EXCEPTION("[linearstore] 64-bit random number generation alignment error");
+    }
+    ::srand(::time(NULL));
+}
 
 uint32_t MessageStoreImpl::chkJrnlWrPageCacheSize(const uint32_t param_, const std::string& paramName_)
 {
@@ -119,13 +116,13 @@ uint16_t MessageStoreImpl::getJrnlWrNumPages(const uint32_t wrPageSizeKib_)
     }
 }
 
-qpid::qls_jrnl::efpPartitionNumber_t MessageStoreImpl::chkEfpPartition(const qpid::qls_jrnl::efpPartitionNumber_t partition_,
+qpid::linearstore::journal::efpPartitionNumber_t MessageStoreImpl::chkEfpPartition(const qpid::linearstore::journal::efpPartitionNumber_t partition_,
                                                                        const std::string& /*paramName_*/) {
     // TODO: check against list of existing partitions, throw if not found
     return partition_;
 }
 
-qpid::qls_jrnl::efpDataSize_kib_t MessageStoreImpl::chkEfpFileSizeKiB(const qpid::qls_jrnl::efpDataSize_kib_t efpFileSizeKib_,
+qpid::linearstore::journal::efpDataSize_kib_t MessageStoreImpl::chkEfpFileSizeKiB(const qpid::linearstore::journal::efpDataSize_kib_t efpFileSizeKib_,
                                                                      const std::string& paramName_) {
     uint8_t rem =  efpFileSizeKib_ % uint64_t(QLS_SBLK_SIZE_KIB);
     if (rem != 0) {
@@ -147,9 +144,9 @@ void MessageStoreImpl::initManagement ()
     if (broker != 0) {
         agent = broker->getManagementAgent();
         if (agent != 0) {
-            _qmf::Package packageInitializer(agent);
-            mgmtObject = _qmf::Store::shared_ptr (
-                new _qmf::Store(agent, this, broker));
+            qmf::org::apache::qpid::linearstore::Package packageInitializer(agent);
+            mgmtObject = qmf::org::apache::qpid::linearstore::Store::shared_ptr (
+                new qmf::org::apache::qpid::linearstore::Store(agent, this, broker));
 
             mgmtObject->set_location(storeDir);
             mgmtObject->set_tplIsInitialized(false);
@@ -171,8 +168,8 @@ bool MessageStoreImpl::init(const qpid::Options* options_)
 {
     // Extract and check options
     const StoreOptions* opts = static_cast<const StoreOptions*>(options_);
-    qpid::qls_jrnl::efpPartitionNumber_t efpPartition = chkEfpPartition(opts->efpPartition, "efp-partition");
-    qpid::qls_jrnl::efpDataSize_kib_t efpFilePoolSize_kib = chkEfpFileSizeKiB(opts->efpFileSizeKib, "efp-file-size");
+    qpid::linearstore::journal::efpPartitionNumber_t efpPartition = chkEfpPartition(opts->efpPartition, "efp-partition");
+    qpid::linearstore::journal::efpDataSize_kib_t efpFilePoolSize_kib = chkEfpFileSizeKiB(opts->efpFileSizeKib, "efp-file-size");
     uint32_t jrnlWrCachePageSizeKib = chkJrnlWrPageCacheSize(opts->wCachePageSizeKib, "wcache-page-size");
     uint32_t tplJrnlWrCachePageSizeKib = chkJrnlWrPageCacheSize(opts->tplWCachePageSizeKib, "tpl-wcache-page-size");
 
@@ -182,8 +179,8 @@ bool MessageStoreImpl::init(const qpid::Options* options_)
 
 // These params, taken from options, are assumed to be correct and verified
 bool MessageStoreImpl::init(const std::string& storeDir_,
-                           qpid::qls_jrnl::efpPartitionNumber_t efpPartition_,
-                           qpid::qls_jrnl::efpDataSize_kib_t efpFileSize_kib_,
+                           qpid::linearstore::journal::efpPartitionNumber_t efpPartition_,
+                           qpid::linearstore::journal::efpDataSize_kib_t efpFileSize_kib_,
                            const bool truncateFlag_,
                            uint32_t wCachePageSizeKib_,
                            uint32_t tplWCachePageSizeKib_)
@@ -230,7 +227,7 @@ void MessageStoreImpl::init()
         }
 
         try {
-            qpid::qls_jrnl::jdir::create_dir(getBdbBaseDir());
+            qpid::linearstore::journal::jdir::create_dir(getBdbBaseDir());
 
             dbenv.reset(new DbEnv(0));
             dbenv->set_errpfx("linearstore");
@@ -282,7 +279,7 @@ void MessageStoreImpl::init()
                 THROW_STORE_EXCEPTION_2("BDB exception occurred while initializing store", e);
         } catch (const StoreException&) {
             throw;
-        } catch (const qpid::qls_jrnl::jexception& e) {
+        } catch (const qpid::linearstore::journal::jexception& e) {
             QLS_LOG(error, "Journal Exception occurred while initializing store: " << e);
             THROW_STORE_EXCEPTION_2("Journal Exception occurred while initializing store", e.what());
         } catch (...) {
@@ -291,7 +288,7 @@ void MessageStoreImpl::init()
         }
     } while (!isInit);
 
-    efpMgr.reset(new qpid::qls_jrnl::EmptyFilePoolManager(getStoreTopLevelDir(),
+    efpMgr.reset(new qpid::linearstore::journal::EmptyFilePoolManager(getStoreTopLevelDir(),
                                                           defaultEfpPartitionNumber,
                                                           defaultEfpFileSize_kib,
                                                           jrnlLog));
@@ -337,9 +334,9 @@ void MessageStoreImpl::truncateInit()
 
     // TODO: Linearstore: harvest all discareded journal files into the empy file pool(s).
 
-    qpid::qls_jrnl::jdir::delete_dir(getBdbBaseDir());
-    qpid::qls_jrnl::jdir::delete_dir(getJrnlBaseDir());
-    qpid::qls_jrnl::jdir::delete_dir(getTplBaseDir());
+    qpid::linearstore::journal::jdir::delete_dir(getBdbBaseDir());
+    qpid::linearstore::journal::jdir::delete_dir(getJrnlBaseDir());
+    qpid::linearstore::journal::jdir::delete_dir(getTplBaseDir());
     QLS_LOG(notice, "Store directory " << getStoreTopLevelDir() << " was truncated.");
     init();
 }
@@ -349,8 +346,8 @@ void MessageStoreImpl::chkTplStoreInit()
     // Prevent multiple threads from late-initializing the TPL
     qpid::sys::Mutex::ScopedLock sl(tplInitLock);
     if (!tplStorePtr->is_ready()) {
-        qpid::qls_jrnl::jdir::create_dir(getTplBaseDir());
-        tplStorePtr->initialize(/*tplNumJrnlFiles, false, 0, tplJrnlFsizeSblks,*/ getEmptyFilePool(defaultEfpPartitionNumber, defaultEfpFileSize_kib), tplWCacheNumPages, tplWCachePgSizeSblks);
+        qpid::linearstore::journal::jdir::create_dir(getTplBaseDir());
+        tplStorePtr->initialize(getEmptyFilePool(defaultEfpPartitionNumber, defaultEfpFileSize_kib), tplWCacheNumPages, tplWCachePgSizeSblks);
         if (mgmtObject.get() != 0) mgmtObject->set_tplIsInitialized(true);
     }
 }
@@ -379,7 +376,7 @@ MessageStoreImpl::~MessageStoreImpl()
         closeDbs();
     } catch (const DbException& e) {
         QLS_LOG(error, "Error closing BDB databases: " <<  e.what());
-    } catch (const qpid::qls_jrnl::jexception& e) {
+    } catch (const qpid::linearstore::journal::jexception& e) {
         QLS_LOG(error, "Error: " << e.what());
     } catch (const std::exception& e) {
         QLS_LOG(error, "Error: " << e.what());
@@ -420,7 +417,7 @@ void MessageStoreImpl::create(qpid::broker::PersistableQueue& queue_,
     queue_.setExternalQueueStore(dynamic_cast<qpid::broker::ExternalQueueStore*>(jQueue));
     try {
         jQueue->initialize(getEmptyFilePool(args_), wCacheNumPages, wCachePgSizeSblks);
-    } catch (const qpid::qls_jrnl::jexception& e) {
+    } catch (const qpid::linearstore::journal::jexception& e) {
         THROW_STORE_EXCEPTION(std::string("Queue ") + queue_.getName() + ": create() failed: " + e.what());
     }
     try {
@@ -432,28 +429,28 @@ void MessageStoreImpl::create(qpid::broker::PersistableQueue& queue_,
     }
 }
 
-qpid::qls_jrnl::EmptyFilePool*
-MessageStoreImpl::getEmptyFilePool(const qpid::qls_jrnl::efpPartitionNumber_t efpPartitionNumber_,
-                                   const qpid::qls_jrnl::efpDataSize_kib_t efpFileSizeKib_) {
-    qpid::qls_jrnl::EmptyFilePool* efpp = efpMgr->getEmptyFilePool(efpPartitionNumber_, efpFileSizeKib_);
+qpid::linearstore::journal::EmptyFilePool*
+MessageStoreImpl::getEmptyFilePool(const qpid::linearstore::journal::efpPartitionNumber_t efpPartitionNumber_,
+                                   const qpid::linearstore::journal::efpDataSize_kib_t efpFileSizeKib_) {
+    qpid::linearstore::journal::EmptyFilePool* efpp = efpMgr->getEmptyFilePool(efpPartitionNumber_, efpFileSizeKib_);
     if (efpp == 0) {
         std::ostringstream oss;
         oss << "Partition=" << efpPartitionNumber_ << "; EfpFileSize=" << efpFileSizeKib_ << " KiB";
-        throw qpid::qls_jrnl::jexception(qpid::qls_jrnl::jerrno::JERR_EFP_NOEFP, oss.str(), "MessageStoreImpl", "getEmptyFilePool");
+        throw qpid::linearstore::journal::jexception(qpid::linearstore::journal::jerrno::JERR_EFP_NOEFP, oss.str(), "MessageStoreImpl", "getEmptyFilePool");
     }
     return efpp;
 }
 
-qpid::qls_jrnl::EmptyFilePool*
+qpid::linearstore::journal::EmptyFilePool*
 MessageStoreImpl::getEmptyFilePool(const qpid::framing::FieldTable& args_) {
     qpid::framing::FieldTable::ValuePtr value;
-    qpid::qls_jrnl::efpPartitionNumber_t localEfpPartition = defaultEfpPartitionNumber;
+    qpid::linearstore::journal::efpPartitionNumber_t localEfpPartition = defaultEfpPartitionNumber;
     value = args_.get("qpid.efp_partition");
     if (value.get() != 0 && !value->empty() && value->convertsTo<int>()) {
         localEfpPartition = chkEfpPartition((uint32_t)value->get<int>(), "qpid.efp_partition");
     }
 
-    qpid::qls_jrnl::efpDataSize_kib_t localEfpFileSizeKib = defaultEfpFileSize_kib;
+    qpid::linearstore::journal::efpDataSize_kib_t localEfpFileSizeKib = defaultEfpFileSize_kib;
     value = args_.get("qpid.efp_file_size");
     if (value.get() != 0 && !value->empty() && value->convertsTo<int>()) {
         localEfpFileSizeKib = chkEfpFileSizeKiB((uint32_t)value->get<int>(),"qpid.efp_file_size" );
@@ -593,6 +590,13 @@ void MessageStoreImpl::recover(qpid::broker::RecoveryManager& registry_)
     txn_list prepared;
     recoverLockedMappings(prepared);
 
+    std::ostringstream oss;
+    oss << "Recovered transaction prepared list:";
+    for (txn_list::iterator i = prepared.begin(); i != prepared.end(); i++) {
+        oss << std::endl << "     " << qpid::linearstore::journal::jcntl::str2hexnum(i->xid);
+    }
+    QLS_LOG(debug, oss.str());
+
     queue_index queues;//id->queue
     exchange_index exchanges;//id->exchange
     message_index messages;//id->message
@@ -600,7 +604,7 @@ void MessageStoreImpl::recover(qpid::broker::RecoveryManager& registry_)
     TxnCtxt txn;
     txn.begin(dbenv.get(), false);
     try {
-        //read all queues, calls recoversMessages
+        //read all queues, calls recoversMessages for each queue
         recoverQueues(txn, registry_, queues, prepared, messages);
 
         //recover exchange & bindings:
@@ -620,6 +624,7 @@ void MessageStoreImpl::recover(qpid::broker::RecoveryManager& registry_)
     }
 
     //recover transactions:
+    qpid::linearstore::journal::txn_map& txn_map_ref = tplStorePtr->get_txn_map();
     for (txn_list::iterator i = prepared.begin(); i != prepared.end(); i++) {
         const PreparedTransaction pt = *i;
         if (mgmtObject.get() != 0) {
@@ -628,20 +633,20 @@ void MessageStoreImpl::recover(qpid::broker::RecoveryManager& registry_)
         }
 
         std::string xid = pt.xid;
-
-        // Restore data token state in TxnCtxt
-        TplRecoverMapCitr citr = tplRecoverMap.find(xid);
-        if (citr == tplRecoverMap.end()) THROW_STORE_EXCEPTION("XID not found in tplRecoverMap");
+        qpid::linearstore::journal::txn_data_list_t tdl = txn_map_ref.get_tdata_list(xid);
+        if (tdl.size() == 0) THROW_STORE_EXCEPTION("XID not found in txn_map");
+        qpid::linearstore::journal::txn_op_stats_t txn_op_stats(tdl);
+        bool commitFlag = txn_op_stats.abortCnt == 0;
 
         // If a record is found that is dequeued but not committed/aborted from tplStore, then a complete() call
         // was interrupted part way through committing/aborting the impacted queues. Complete this process.
-        bool incomplTplTxnFlag = citr->second.deq_flag;
+        bool incomplTplTxnFlag = txn_op_stats.deqCnt > 0;
 
-        if (citr->second.tpc_flag) {
+        if (txn_op_stats.tpcCnt > 0) {
             // Dtx (2PC) transaction
             TPCTxnCtxt* tpcc = new TPCTxnCtxt(xid, &messageIdSequence);
             std::auto_ptr<qpid::broker::TPCTransactionContext> txn(tpcc);
-            tpcc->recoverDtok(citr->second.rid, xid);
+            tpcc->recoverDtok(txn_op_stats.rid, xid);
             tpcc->prepare(tplStorePtr.get());
 
             qpid::broker::RecoverableTransaction::shared_ptr dtx;
@@ -660,12 +665,12 @@ void MessageStoreImpl::recover(qpid::broker::RecoveryManager& registry_)
             }
 
             if (incomplTplTxnFlag) {
-                tpcc->complete(citr->second.commit_flag);
+                tpcc->complete(commitFlag);
             }
         } else {
             // Local (1PC) transaction
             boost::shared_ptr<TxnCtxt> opcc(new TxnCtxt(xid, &messageIdSequence));
-            opcc->recoverDtok(citr->second.rid, xid);
+            opcc->recoverDtok(txn_op_stats.rid, xid);
             opcc->prepare(tplStorePtr.get());
 
             if (pt.enqueues.get()) {
@@ -679,11 +684,12 @@ void MessageStoreImpl::recover(qpid::broker::RecoveryManager& registry_)
                 }
             }
             if (incomplTplTxnFlag) {
-                opcc->complete(citr->second.commit_flag);
+                opcc->complete(commitFlag);
             } else {
-                completed(*opcc.get(), citr->second.commit_flag);
+                completed(*opcc.get(), commitFlag);
             }
         }
+
     }
     registry_.recoveryComplete();
 }
@@ -694,7 +700,6 @@ void MessageStoreImpl::recoverQueues(TxnCtxt& txn,
                                      txn_list& prepared,
                                      message_index& messages)
 {
-    QLS_LOG(info,   "*** MessageStoreImpl::recoverQueues()");
     Cursor queues;
     queues.open(queueDb, txn.get());
 
@@ -731,7 +736,7 @@ void MessageStoreImpl::recoverQueues(TxnCtxt& txn,
             long rcnt = 0L;     // recovered msg count
             long idcnt = 0L;    // in-doubt msg count
             uint64_t thisHighestRid = 0ULL;
-            jQueue->recover(boost::dynamic_pointer_cast<qpid::qls_jrnl::EmptyFilePoolManager>(efpMgr), wCacheNumPages, wCachePgSizeSblks, &prepared, thisHighestRid, key.id);
+            jQueue->recover(boost::dynamic_pointer_cast<qpid::linearstore::journal::EmptyFilePoolManager>(efpMgr), wCacheNumPages, wCachePgSizeSblks, &prepared, thisHighestRid, key.id);
 
             // Check for changes to queue store settings qpid.file_count and qpid.file_size resulting
             // from recovery of a store that has had its size changed externally by the resize utility.
@@ -757,7 +762,7 @@ void MessageStoreImpl::recoverQueues(TxnCtxt& txn,
             recoverMessages(txn, registry, queue, prepared, messages, rcnt, idcnt);
             QLS_LOG(info, "Recovered queue \"" << queueName << "\": " << rcnt << " messages recovered; " << idcnt << " messages in-doubt.");
             jQueue->recover_complete(); // start journal.
-        } catch (const qpid::qls_jrnl::jexception& e) {
+        } catch (const qpid::linearstore::journal::jexception& e) {
             THROW_STORE_EXCEPTION(std::string("Queue ") + queueName + ": recoverQueues() failed: " + e.what());
         }
         //read all messages: done on a per queue basis if using Journal
@@ -869,7 +874,6 @@ void MessageStoreImpl::recoverMessages(TxnCtxt& /*txn*/,
                                        long& rcnt,
                                        long& idcnt)
 {
-    QLS_LOG(info,   "*** MessageStoreImpl::recoverMessages() queue=\"" << queue->getName() << "\"");
     size_t preambleLength = sizeof(uint32_t)/*header size*/;
 
     JournalImpl* jc = static_cast<JournalImpl*>(queue->getExternalQueueStore());
@@ -889,16 +893,17 @@ void MessageStoreImpl::recoverMessages(TxnCtxt& /*txn*/,
     bool externalFlag = false;
     DataTokenImpl dtok;
     dtok.set_wstate(DataTokenImpl::NONE);
+    qpid::linearstore::journal::txn_map& txn_map_ref = tplStorePtr->get_txn_map();
 
     // Read the message from the Journal.
     try {
         unsigned aio_sleep_cnt = 0;
         while (read) {
-            qpid::qls_jrnl::iores res = jc->read_data_record(&dbuff, dbuffSize, &xidbuff, xidbuffSize, transientFlag, externalFlag, &dtok);
+            qpid::linearstore::journal::iores res = jc->read_data_record(&dbuff, dbuffSize, &xidbuff, xidbuffSize, transientFlag, externalFlag, &dtok, false);
 
             switch (res)
             {
-              case qpid::qls_jrnl::RHM_IORES_SUCCESS: {
+              case qpid::linearstore::journal::RHM_IORES_SUCCESS: {
                 msg_count++;
                 qpid::broker::RecoverableMessage::shared_ptr msg;
                 char* data = (char*)dbuff;
@@ -908,7 +913,7 @@ void MessageStoreImpl::recoverMessages(TxnCtxt& /*txn*/,
                     msg = getExternMessage(recovery, dtok.rid(), headerSize); // large message external to jrnl
                 } else {
                     headerSize = qpid::framing::Buffer(data, preambleLength).getLong();
-                    qpid::framing::Buffer headerBuff(data+ preambleLength, headerSize); /// do we want read size or header size ????
+                    qpid::framing::Buffer headerBuff(data+ preambleLength, headerSize);
                     msg = recovery.recoverMessage(headerBuff);
                 }
                 msg->setPersistenceId(dtok.rid());
@@ -933,30 +938,30 @@ void MessageStoreImpl::recoverMessages(TxnCtxt& /*txn*/,
                 } else {
                     uint64_t rid = dtok.rid();
                     std::string xid(i->xid);
-                    TplRecoverMapCitr citr = tplRecoverMap.find(xid);
-                    if (citr == tplRecoverMap.end()) THROW_STORE_EXCEPTION("XID not found in tplRecoverMap");
-
-                    // deq present in prepared list: this xid is part of incomplete txn commit/abort
-                    // or this is a 1PC txn that must be rolled forward
-                    if (citr->second.deq_flag || !citr->second.tpc_flag) {
+                    qpid::linearstore::journal::txn_data_list_t tdl = txn_map_ref.get_tdata_list(xid);
+                    if (tdl.size() == 0) THROW_STORE_EXCEPTION("XID not found in txn_map");
+                    qpid::linearstore::journal::txn_op_stats_t txn_op_stats(tdl);
+                    if (txn_op_stats.deqCnt > 0 || txn_op_stats.tpcCnt == 0) {
                         if (jc->is_enqueued(rid, true)) {
                             // Enqueue is non-tx, dequeue tx
                             assert(jc->is_locked(rid)); // This record MUST be locked by a txn dequeue
-                            if (!citr->second.commit_flag) {
+                            if (txn_op_stats.abortCnt > 0) {
                                 rcnt++;
                                 queue->recover(msg); // recover message in abort case only
                             }
                         } else {
                             // Enqueue and/or dequeue tx
-                            qpid::qls_jrnl::txn_map& tmap = jc->get_txn_map();
-                            qpid::qls_jrnl::txn_data_list txnList = tmap.get_tdata_list(xid); // txnList will be empty if xid not found
+                            qpid::linearstore::journal::txn_map& tmap = jc->get_txn_map();
+                            qpid::linearstore::journal::txn_data_list_t txnList = tmap.get_tdata_list(xid); // txnList will be empty if xid not found
                             bool enq = false;
                             bool deq = false;
-                            for (qpid::qls_jrnl::tdl_itr j = txnList.begin(); j<txnList.end(); j++) {
-                                if (j->enq_flag_ && j->rid_ == rid) enq = true;
-                                else if (!j->enq_flag_ && j->drid_ == rid) deq = true;
+                            for (qpid::linearstore::journal::tdl_itr_t j = txnList.begin(); j<txnList.end(); j++) {
+                                if (j->enq_flag_ && j->rid_ == rid)
+                                    enq = true;
+                                else if (!j->enq_flag_ && j->drid_ == rid)
+                                    deq = true;
                             }
-                            if (enq && !deq && citr->second.commit_flag) {
+                            if (enq && !deq && txn_op_stats.abortCnt == 0) {
                                 rcnt++;
                                 queue->recover(msg); // recover txn message in commit case only
                             }
@@ -970,28 +975,32 @@ void MessageStoreImpl::recoverMessages(TxnCtxt& /*txn*/,
                 dtok.reset();
                 dtok.set_wstate(DataTokenImpl::NONE);
 
-                if (xidbuff)
+                if (xidbuff) {
                     ::free(xidbuff);
-                else if (dbuff)
+                    xidbuff = NULL;
+                }
+                if (dbuff) {
                     ::free(dbuff);
+                    dbuff = NULL;
+                }
                 aio_sleep_cnt = 0;
                 break;
               }
-              case qpid::qls_jrnl::RHM_IORES_PAGE_AIOWAIT:
+              case qpid::linearstore::journal::RHM_IORES_PAGE_AIOWAIT:
                 if (++aio_sleep_cnt > MAX_AIO_SLEEPS)
                     THROW_STORE_EXCEPTION("Timeout waiting for AIO in MessageStoreImpl::recoverMessages()");
                 ::usleep(AIO_SLEEP_TIME_US);
                 break;
-              case qpid::qls_jrnl::RHM_IORES_EMPTY:
+              case qpid::linearstore::journal::RHM_IORES_EMPTY:
                 read = false;
                 break; // done with all messages. (add call in jrnl to test that _emap is empty.)
               default:
                 std::ostringstream oss;
-                oss << "recoverMessages(): Queue: " << queue->getName() << ": Unexpected return from journal read: " << qpid::qls_jrnl::iores_str(res);
+                oss << "recoverMessages(): Queue: " << queue->getName() << ": Unexpected return from journal read: " << qpid::linearstore::journal::iores_str(res);
                 THROW_STORE_EXCEPTION(oss.str());
             } // switch
         } // while
-    } catch (const qpid::qls_jrnl::jexception& e) {
+    } catch (const qpid::linearstore::journal::jexception& e) {
         THROW_STORE_EXCEPTION(std::string("Queue ") + queue->getName() + ": recoverMessages() failed: " + e.what());
     }
 }
@@ -1000,7 +1009,7 @@ qpid::broker::RecoverableMessage::shared_ptr MessageStoreImpl::getExternMessage(
                                                                                 uint64_t /*messageId*/,
                                                                                 unsigned& /*headerSize*/)
 {
-    throw qpid::qls_jrnl::jexception(qpid::qls_jrnl::jerrno::JERR__NOTIMPL, "MessageStoreImpl", "getExternMessage");
+    throw qpid::linearstore::journal::jexception(qpid::linearstore::journal::jerrno::JERR__NOTIMPL, "MessageStoreImpl", "getExternMessage");
 }
 
 int MessageStoreImpl::enqueueMessage(TxnCtxt& txn_,
@@ -1034,142 +1043,67 @@ int MessageStoreImpl::enqueueMessage(TxnCtxt& txn_,
     return count;
 }
 
-void MessageStoreImpl::readTplStore()
-{
-    QLS_LOG(info,   "*** MessageStoreImpl::readTplStore()");
-    tplRecoverMap.clear();
-    qpid::qls_jrnl::txn_map& tmap = tplStorePtr->get_txn_map();
-    DataTokenImpl dtok;
-    void* dbuff = NULL; size_t dbuffSize = 0;
-    void* xidbuff = NULL; size_t xidbuffSize = 0;
-    bool transientFlag = false;
-    bool externalFlag = false;
-    bool done = false;
-    try {
-        unsigned aio_sleep_cnt = 0;
-        while (!done) {
-            dtok.reset();
-            dtok.set_wstate(DataTokenImpl::ENQ);
-            qpid::qls_jrnl::iores res = tplStorePtr->read_data_record(&dbuff, dbuffSize, &xidbuff, xidbuffSize, transientFlag, externalFlag, &dtok);
-            switch (res) {
-              case qpid::qls_jrnl::RHM_IORES_SUCCESS: {
-                // Every TPL record contains both data and an XID
-                assert(dbuffSize>0);
-                assert(xidbuffSize>0);
-                std::string xid(static_cast<const char*>(xidbuff), xidbuffSize);
-                bool is2PC = *(static_cast<char*>(dbuff)) != 0;
-
-                // Check transaction details; add to recover map
-                qpid::qls_jrnl::txn_data_list txnList = tmap.get_tdata_list(xid); //  txnList will be empty if xid not found
-                if (!txnList.empty()) { // xid found in tmap
-                    unsigned enqCnt = 0;
-                    unsigned deqCnt = 0;
-                    uint64_t rid = 0;
-
-                    // Assume commit (roll forward) in cases where only prepare has been called - ie only enqueue record exists.
-                    // Note: will apply to both 1PC and 2PC transactions.
-                    bool commitFlag = true;
-
-                    for (qpid::qls_jrnl::tdl_itr j = txnList.begin(); j<txnList.end(); j++) {
-                        if (j->enq_flag_) {
-                            rid = j->rid_;
-                            enqCnt++;
-                        } else {
-                            commitFlag = j->commit_flag_;
-                            deqCnt++;
-                        }
-                    }
-                    assert(enqCnt == 1);
-                    assert(deqCnt <= 1);
-                    tplRecoverMap.insert(TplRecoverMapPair(xid, TplRecoverStruct(rid, deqCnt == 1, commitFlag, is2PC)));
-                }
-
-                ::free(xidbuff);
-                aio_sleep_cnt = 0;
-                break;
-                }
-              case qpid::qls_jrnl::RHM_IORES_PAGE_AIOWAIT:
-                if (++aio_sleep_cnt > MAX_AIO_SLEEPS)
-                    THROW_STORE_EXCEPTION("Timeout waiting for AIO in MessageStoreImpl::recoverTplStore()");
-                ::usleep(AIO_SLEEP_TIME_US);
-                break;
-              case qpid::qls_jrnl::RHM_IORES_EMPTY:
-                done = true;
-                break; // done with all messages. (add call in jrnl to test that _emap is empty.)
-              default:
-                std::ostringstream oss;
-                oss << "readTplStore(): Unexpected result from journal read: " << qpid::qls_jrnl::iores_str(res);
-                THROW_STORE_EXCEPTION(oss.str());
-            } // switch
-        }
-    } catch (const qpid::qls_jrnl::jexception& e) {
-        THROW_STORE_EXCEPTION(std::string("TPL recoverTplStore() failed: ") + e.what());
-    }
-}
 
 void MessageStoreImpl::recoverTplStore()
 {
-    QLS_LOG(info,   "*** MessageStoreImpl::recoverTplStore()");
-    if (qpid::qls_jrnl::jdir::exists(tplStorePtr->jrnl_dir())) {
+    if (qpid::linearstore::journal::jdir::exists(tplStorePtr->jrnl_dir())) {
         uint64_t thisHighestRid = 0ULL;
-        tplStorePtr->recover(boost::dynamic_pointer_cast<qpid::qls_jrnl::EmptyFilePoolManager>(efpMgr), tplWCacheNumPages, tplWCachePgSizeSblks, 0, thisHighestRid, 0);
+        tplStorePtr->recover(boost::dynamic_pointer_cast<qpid::linearstore::journal::EmptyFilePoolManager>(efpMgr), tplWCacheNumPages, tplWCachePgSizeSblks, 0, thisHighestRid, 0);
         if (highestRid == 0ULL)
             highestRid = thisHighestRid;
         else if (thisHighestRid - highestRid  < 0x8000000000000000ULL) // RFC 1982 comparison for unsigned 64-bit
             highestRid = thisHighestRid;
-
-        // Load tplRecoverMap by reading the TPL store
-        readTplStore();
-
-        tplStorePtr->recover_complete(); // start journal.
+        tplStorePtr->recover_complete(); // start TPL
     }
 }
 
 void MessageStoreImpl::recoverLockedMappings(txn_list& txns)
 {
-    QLS_LOG(info,   "*** MessageStoreImpl::recoverLockedMappings()");
     if (!tplStorePtr->is_ready())
         recoverTplStore();
-
-    // Abort unprepared xids and populate the locked maps
-    for (TplRecoverMapCitr i = tplRecoverMap.begin(); i != tplRecoverMap.end(); i++) {
+    std::vector<std::string> xidList;
+    tplStorePtr->get_txn_map().xid_list(xidList);
+    for (std::vector<std::string>::const_iterator i=xidList.begin(); i!=xidList.end(); ++i) {
         LockedMappings::shared_ptr enq_ptr;
         enq_ptr.reset(new LockedMappings);
         LockedMappings::shared_ptr deq_ptr;
         deq_ptr.reset(new LockedMappings);
-        txns.push_back(new PreparedTransaction(i->first, enq_ptr, deq_ptr));
+        txns.push_back(new PreparedTransaction(*i, enq_ptr, deq_ptr));
     }
 }
 
 void MessageStoreImpl::collectPreparedXids(std::set<std::string>& xids)
 {
-    QLS_LOG(info,   "*** MessageStoreImpl::collectPreparedXids()");
-    if (tplStorePtr->is_ready()) {
-        readTplStore();
-    } else {
+    if (!tplStorePtr->is_ready()) {
         recoverTplStore();
     }
-    for (TplRecoverMapCitr i = tplRecoverMap.begin(); i != tplRecoverMap.end(); i++) {
-        // Discard all txns that are to be rolled forward/back and 1PC transactions
-        if (!i->second.deq_flag && i->second.tpc_flag)
-            xids.insert(i->first);
+    std::vector<std::string> xidList;
+    tplStorePtr->get_txn_map().xid_list(xidList);
+    for (std::vector<std::string>::const_iterator i=xidList.begin(); i!=xidList.end(); ++i) {
+        qpid::linearstore::journal::txn_data_list_t tdl = tplStorePtr->get_txn_map().get_tdata_list(*i);
+        qpid::linearstore::journal::txn_op_stats_t txn_op_stats(tdl);
+        if (txn_op_stats.tpcCnt > 0) {
+            if (txn_op_stats.enqCnt - txn_op_stats.deqCnt > 0) {
+                xids.insert(*i);
+            }
+        }
     }
 }
 
 void MessageStoreImpl::stage(const boost::intrusive_ptr<qpid::broker::PersistableMessage>& /*msg*/)
 {
-    throw qpid::qls_jrnl::jexception(qpid::qls_jrnl::jerrno::JERR__NOTIMPL, "MessageStoreImpl", "stage");
+    throw qpid::linearstore::journal::jexception(qpid::linearstore::journal::jerrno::JERR__NOTIMPL, "MessageStoreImpl", "stage");
 }
 
 void MessageStoreImpl::destroy(qpid::broker::PersistableMessage& /*msg*/)
 {
-    throw qpid::qls_jrnl::jexception(qpid::qls_jrnl::jerrno::JERR__NOTIMPL, "MessageStoreImpl", "destroy");
+    throw qpid::linearstore::journal::jexception(qpid::linearstore::journal::jerrno::JERR__NOTIMPL, "MessageStoreImpl", "destroy");
 }
 
 void MessageStoreImpl::appendContent(const boost::intrusive_ptr<const qpid::broker::PersistableMessage>& /*msg*/,
                                      const std::string& /*data*/)
 {
-    throw qpid::qls_jrnl::jexception(qpid::qls_jrnl::jerrno::JERR__NOTIMPL, "MessageStoreImpl", "appendContent");
+    throw qpid::linearstore::journal::jexception(qpid::linearstore::journal::jerrno::JERR__NOTIMPL, "MessageStoreImpl", "appendContent");
 }
 
 void MessageStoreImpl::loadContent(const qpid::broker::PersistableQueue& /*queue*/,
@@ -1178,7 +1112,7 @@ void MessageStoreImpl::loadContent(const qpid::broker::PersistableQueue& /*queue
                                    uint64_t /*offset*/,
                                    uint32_t /*length*/)
 {
-    throw qpid::qls_jrnl::jexception(qpid::qls_jrnl::jerrno::JERR__NOTIMPL, "MessageStoreImpl", "loadContent");
+    throw qpid::linearstore::journal::jexception(qpid::linearstore::journal::jerrno::JERR__NOTIMPL, "MessageStoreImpl", "loadContent");
 }
 
 void MessageStoreImpl::flush(const qpid::broker::PersistableQueue& queue_)
@@ -1191,9 +1125,9 @@ void MessageStoreImpl::flush(const qpid::broker::PersistableQueue& queue_)
         JournalImpl* jc = static_cast<JournalImpl*>(queue_.getExternalQueueStore());
         if (jc) {
             // TODO: check if this result should be used...
-            /*mrg::journal::iores res =*/ jc->flush();
+            /*mrg::journal::iores res =*/ jc->flush(false);
         }
-    } catch (const qpid::qls_jrnl::jexception& e) {
+    } catch (const qpid::linearstore::journal::jexception& e) {
         THROW_STORE_EXCEPTION(std::string("Queue ") + qn + ": flush() failed: " + e.what() );
     }
 }
@@ -1263,12 +1197,12 @@ void MessageStoreImpl::store(const qpid::broker::PersistableQueue* queue_,
             if (txn_->getXid().empty()) {
                 jc->enqueue_data_record(&buff[0], size, size, dtokp.get(), !message_->isPersistent());
             } else {
-                jc->enqueue_txn_data_record(&buff[0], size, size, dtokp.get(), txn_->getXid(), !message_->isPersistent());
+                jc->enqueue_txn_data_record(&buff[0], size, size, dtokp.get(), txn_->getXid(), txn_->isTPC(), !message_->isPersistent());
             }
         } else {
             THROW_STORE_EXCEPTION(std::string("MessageStoreImpl::store() failed: queue NULL."));
        }
-    } catch (const qpid::qls_jrnl::jexception& e) {
+    } catch (const qpid::linearstore::journal::jexception& e) {
         THROW_STORE_EXCEPTION(std::string("Queue ") + queue_->getName() + ": MessageStoreImpl::store() failed: " +
                               e.what());
     }
@@ -1314,9 +1248,10 @@ void MessageStoreImpl::async_dequeue(qpid::broker::TransactionContext* ctxt_,
     ddtokp->set_rid(messageIdSequence.next());
     ddtokp->set_dequeue_rid(msg_->getPersistenceId());
     ddtokp->set_wstate(DataTokenImpl::ENQ);
+    TxnCtxt* txn = 0;
     std::string tid;
     if (ctxt_) {
-        TxnCtxt* txn = check(ctxt_);
+        txn = check(ctxt_);
         tid = txn->getXid();
     }
     // Manually increase the ref count, as raw pointers are used beyond this point
@@ -1324,11 +1259,11 @@ void MessageStoreImpl::async_dequeue(qpid::broker::TransactionContext* ctxt_,
     try {
         JournalImpl* jc = static_cast<JournalImpl*>(queue_.getExternalQueueStore());
         if (tid.empty()) {
-            jc->dequeue_data_record(ddtokp.get());
+            jc->dequeue_data_record(ddtokp.get(), false);
         } else {
-            jc->dequeue_txn_data_record(ddtokp.get(), tid);
+            jc->dequeue_txn_data_record(ddtokp.get(), tid, txn?txn->isTPC():false, false);
         }
-    } catch (const qpid::qls_jrnl::jexception& e) {
+    } catch (const qpid::linearstore::journal::jexception& e) {
         ddtokp->release();
         THROW_STORE_EXCEPTION(std::string("Queue ") + queue_.getName() + ": async_dequeue() failed: " + e.what());
     }
@@ -1346,7 +1281,7 @@ void MessageStoreImpl::completed(TxnCtxt& txn_,
             DataTokenImpl* dtokp = txn_.getDtok();
             dtokp->set_dequeue_rid(dtokp->rid());
             dtokp->set_rid(messageIdSequence.next());
-            tplStorePtr->dequeue_txn_data_record(txn_.getDtok(), txn_.getXid(), commit_);
+            tplStorePtr->dequeue_txn_data_record(txn_.getDtok(), txn_.getXid(), txn_.isTPC(), commit_);
         }
         txn_.complete(commit_);
         if (mgmtObject.get() != 0) {
@@ -1357,7 +1292,7 @@ void MessageStoreImpl::completed(TxnCtxt& txn_,
                 mgmtObject->inc_tplTxnAborts();
         }
     } catch (const std::exception& e) {
-        QLS_LOG(error, "Error completing xid " << txn_.getXid() << ": " << e.what());
+        QLS_LOG(error, "Error completing xid " << qpid::linearstore::journal::jcntl::str2hexnum(txn_.getXid()) << ": " << e.what());
         throw;
     }
 }
@@ -1381,12 +1316,16 @@ void MessageStoreImpl::prepare(qpid::broker::TPCTransactionContext& ctxt_)
 {
     checkInit();
     TxnCtxt* txn = dynamic_cast<TxnCtxt*>(&ctxt_);
+//std::string xid=txn->getXid(); std::cout << "*** MessageStoreImpl::prepare() xid=" << std::hex;
+//for (unsigned i=0; i<xid.length(); ++i) std::cout << "\\" << (int)xid.at(i); std::cout << " ***" << std::dec << std::endl;
     if(!txn) throw qpid::broker::InvalidTransactionContextException();
     localPrepare(txn);
 }
 
 void MessageStoreImpl::localPrepare(TxnCtxt* ctxt_)
 {
+//std::string xid=ctxt_->getXid(); std::cout << "*** MessageStoreImpl::localPrepare() xid=" << std::hex;
+//for (unsigned i=0; i<xid.length(); ++i) std::cout << "\\" << (int)xid.at(i); std::cout << " ***" << std::dec << std::endl;
     try {
         chkTplStoreInit(); // Late initialize (if needed)
 
@@ -1399,7 +1338,7 @@ void MessageStoreImpl::localPrepare(TxnCtxt* ctxt_)
         dtokp->set_external_rid(true);
         dtokp->set_rid(messageIdSequence.next());
         char tpcFlag = static_cast<char>(ctxt_->isTPC());
-        tplStorePtr->enqueue_txn_data_record(&tpcFlag, sizeof(char), sizeof(char), dtokp, ctxt_->getXid(), false);
+        tplStorePtr->enqueue_txn_data_record(&tpcFlag, sizeof(char), sizeof(char), dtokp, ctxt_->getXid(), tpcFlag != 0, false);
         ctxt_->prepare(tplStorePtr.get());
         // make sure all the data is written to disk before returning
         ctxt_->sync();

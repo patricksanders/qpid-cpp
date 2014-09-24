@@ -21,14 +21,16 @@
 
 #include "qpid/linearstore/JournalLogImpl.h"
 
+#include "qpid/log/Statement.h"
+
 namespace qpid {
 namespace linearstore {
 
-JournalLogImpl::JournalLogImpl(const qpid::qls_jrnl::JournalLog::log_level_t logLevelThreshold) : qpid::qls_jrnl::JournalLog(logLevelThreshold) {}
+JournalLogImpl::JournalLogImpl(const qpid::linearstore::journal::JournalLog::log_level_t logLevelThreshold) : qpid::linearstore::journal::JournalLog(logLevelThreshold) {}
 JournalLogImpl::~JournalLogImpl() {}
 
 void
-JournalLogImpl::log(const qpid::qls_jrnl::JournalLog::log_level_t level,
+JournalLogImpl::log(const qpid::linearstore::journal::JournalLog::log_level_t level,
                     const std::string& log_stmt) const {
     switch (level) {
       case LOG_CRITICAL: QPID_LOG(critical, "Linear Store: " << log_stmt); break;
@@ -42,17 +44,17 @@ JournalLogImpl::log(const qpid::qls_jrnl::JournalLog::log_level_t level,
 }
 
 void
-JournalLogImpl::log(const qpid::qls_jrnl::JournalLog::log_level_t level,
+JournalLogImpl::log(const qpid::linearstore::journal::JournalLog::log_level_t level,
                     const std::string& jid,
                     const std::string& log_stmt) const {
     switch (level) {
-      case LOG_CRITICAL: QPID_LOG(critical, "Linear Store: Journal \'" << jid << "\":" << log_stmt); break;
-      case LOG_ERROR: QPID_LOG(error, "Linear Store: Journal \'" << jid << "\":" << log_stmt); break;
-      case LOG_WARN: QPID_LOG(warning, "Linear Store: Journal \'" << jid << "\":" << log_stmt); break;
-      case LOG_NOTICE: QPID_LOG(notice, "Linear Store: Journal \'" << jid << "\":" << log_stmt); break;
-      case LOG_INFO: QPID_LOG(info, "Linear Store: Journal \'" << jid << "\":" << log_stmt); break;
-      case LOG_DEBUG: QPID_LOG(debug, "Linear Store: Journal \'" << jid << "\":" << log_stmt); break;
-      default: QPID_LOG(trace, "Linear Store: Journal \'" << jid << "\":" << log_stmt);
+      case LOG_CRITICAL: QPID_LOG(critical, "Linear Store: Journal \"" << jid << "\": " << log_stmt); break;
+      case LOG_ERROR: QPID_LOG(error, "Linear Store: Journal \"" << jid << "\": " << log_stmt); break;
+      case LOG_WARN: QPID_LOG(warning, "Linear Store: Journal \"" << jid << "\": " << log_stmt); break;
+      case LOG_NOTICE: QPID_LOG(notice, "Linear Store: Journal \"" << jid << "\": " << log_stmt); break;
+      case LOG_INFO: QPID_LOG(info, "Linear Store: Journal \"" << jid << "\": " << log_stmt); break;
+      case LOG_DEBUG: QPID_LOG(debug, "Linear Store: Journal \"" << jid << "\": " << log_stmt); break;
+      default: QPID_LOG(trace, "Linear Store: Journal \"" << jid << "\": " << log_stmt);
     }
 }
 

@@ -19,16 +19,14 @@
  *
  */
 
-#ifndef QPID_LEGACYSTORE_PREPAREDTRANSACTION_H
-#define QPID_LEGACYSTORE_PREPAREDTRANSACTION_H
+#ifndef QPID_LINEARSTORE_PREPAREDTRANSACTION_H
+#define QPID_LINEARSTORE_PREPAREDTRANSACTION_H
 
+#include <boost/ptr_container/ptr_list.hpp>
+#include <boost/shared_ptr.hpp>
 #include <list>
 #include <map>
-#include <set>
 #include <stdint.h>
-#include <string>
-#include <boost/shared_ptr.hpp>
-#include <boost/ptr_container/ptr_list.hpp>
 
 namespace qpid{
 namespace linearstore{
@@ -72,4 +70,4 @@ struct PreparedTransaction
 
 }}
 
-#endif // ifndef QPID_LEGACYSTORE_PREPAREDTRANSACTION_H
+#endif // ifndef QPID_LINEARSTORE_PREPAREDTRANSACTION_H

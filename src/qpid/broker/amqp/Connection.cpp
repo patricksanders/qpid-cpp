@@ -30,6 +30,7 @@
 #include "qpid/framing/ProtocolVersion.h"
 #include "qpid/log/Statement.h"
 #include "qpid/sys/OutputControl.h"
+#include "config.h"
 #include <sstream>
 extern "C" {
 #include <proton/engine.h>
@@ -39,12 +40,37 @@ extern "C" {
 namespace qpid {
 namespace broker {
 namespace amqp {
+namespace {
+//remove conditional when 0.5 is no longer supported
+#ifdef HAVE_PROTON_TRACER
+void do_trace(pn_transport_t* transport, const char* message)
+{
+    Connection* c = reinterpret_cast<Connection*>(pn_transport_get_context(transport));
+    if (c) c->trace(message);
+}
+
+void set_tracer(pn_transport_t* transport, void* context)
+{
+    pn_transport_set_context(transport, context);
+    pn_transport_set_tracer(transport, &do_trace);
+}
+#else
+void set_tracer(pn_transport_t*, void*)
+{
+}
+#endif
+}
+
+void Connection::trace(const char* message) const
+{
+    QPID_LOG_CAT(trace, protocol, "[" << id << "]: " << message);
+}
 
 Connection::Connection(qpid::sys::OutputControl& o, const std::string& i, BrokerContext& b, bool saslInUse)
     : BrokerContext(b), ManagedConnection(getBroker(), i),
       connection(pn_connection()),
       transport(pn_transport()),
-      out(o), id(i), haveOutput(true), closeInitiated(false)
+      out(o), id(i), haveOutput(true), closeInitiated(false), closeRequested(false)
 {
     if (pn_transport_bind(transport, connection)) {
         //error
@@ -53,7 +79,10 @@ Connection::Connection(qpid::sys::OutputControl& o, const std::string& i, Broker
     out.activateOutput();
     bool enableTrace(false);
     QPID_LOG_TEST_CAT(trace, protocol, enableTrace);
-    if (enableTrace) pn_transport_trace(transport, PN_TRACE_FRM);
+    if (enableTrace) {
+        pn_transport_trace(transport, PN_TRACE_FRM);
+        set_tracer(transport, this);
+    }
 
     getBroker().getConnectionObservers().connection(*this);
     if (!saslInUse) {
@@ -140,9 +169,22 @@ size_t Connection::encode(char* buffer, size_t size)
 bool Connection::canEncode()
 {
     if (!closeInitiated) {
+        if (closeRequested) {
+            close();
+            return true;
+        }
         try {
-            for (Sessions::iterator i = sessions.begin();i != sessions.end(); ++i) {
-                if (i->second->dispatch()) haveOutput = true;
+            for (Sessions::iterator i = sessions.begin();i != sessions.end();) {
+                if (i->second->endedByManagement()) {
+                    pn_session_close(i->first);
+                    i->second->close();
+                    sessions.erase(i++);
+                    haveOutput = true;
+                    QPID_LOG_CAT(debug, model, id << " session ended by management");
+                } else {
+                    if (i->second->dispatch()) haveOutput = true;
+                    ++i;
+                }
             }
             process();
         } catch (const Exception& e) {
@@ -342,5 +384,11 @@ void Connection::setUserId(const std::string& user)
     {
         throw Exception(qpid::amqp::error_conditions::RESOURCE_LIMIT_EXCEEDED, "User connection denied by configured limit");
     }
+}
+
+void Connection::closedByManagement()
+{
+    closeRequested = true;
+    out.activateOutput();
 }
 }}} // namespace qpid::broker::amqp

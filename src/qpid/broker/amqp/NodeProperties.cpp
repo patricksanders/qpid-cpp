@@ -27,6 +27,7 @@
 #include "qpid/amqp/Descriptor.h"
 #include "qpid/amqp/descriptors.h"
 #include "qpid/amqp_0_10/Codecs.h"
+#include "qpid/types/encodings.h"
 #include "qpid/types/Variant.h"
 #include "qpid/broker/QueueSettings.h"
 #include "qpid/log/Statement.h"
@@ -53,6 +54,7 @@ const std::string EXCLUSIVE("exclusive");
 const std::string AUTO_DELETE("auto-delete");
 const std::string ALTERNATE_EXCHANGE("alternate-exchange");
 const std::string EXCHANGE_TYPE("exchange-type");
+const std::string EMPTY;
 
 pn_bytes_t convert(const std::string& s)
 {
@@ -110,6 +112,7 @@ void NodeProperties::read(pn_data_t* data)
 {
     DataReader reader(*this);
     reader.read(data);
+
 }
 
 bool NodeProperties::wasSpecified(const std::string& key) const
@@ -125,7 +128,7 @@ void NodeProperties::write(pn_data_t* data, boost::shared_ptr<Queue> node)
         pn_data_put_symbol(data, convert(SUPPORTED_DIST_MODES));
         pn_data_put_string(data, convert(MOVE));//TODO: should really add COPY as well, since queues can be browsed
         pn_bytes_t symbol;
-        if (autoDelete && node->isAutoDelete() && getLifetimeDescriptorSymbol(node->getSettings().lifetime, symbol)) {
+        if (wasSpecified(AUTO_DELETE) && node->isAutoDelete() && getLifetimeDescriptorSymbol(node->getSettings().lifetime, symbol)) {
             pn_data_put_symbol(data, convert(LIFETIME_POLICY));
             pn_data_put_described(data);
             pn_data_enter(data);
@@ -133,11 +136,11 @@ void NodeProperties::write(pn_data_t* data, boost::shared_ptr<Queue> node)
             pn_data_put_list(data);
             pn_data_exit(data);
         }
-        if (durable && node->isDurable()) {
+        if (wasSpecified(DURABLE) && node->isDurable()) {
             pn_data_put_symbol(data, convert(DURABLE));
             pn_data_put_bool(data, true);
         }
-        if (exclusive && node->hasExclusiveOwner()) {
+        if (wasSpecified(EXCLUSIVE) && node->hasExclusiveOwner()) {
             pn_data_put_symbol(data, convert(EXCLUSIVE));
             pn_data_put_bool(data, true);
         }
@@ -175,7 +178,7 @@ void NodeProperties::write(pn_data_t* data, boost::shared_ptr<Exchange> node)
         pn_data_enter(data);
         pn_data_put_symbol(data, convert(SUPPORTED_DIST_MODES));
         pn_data_put_string(data, convert(COPY));
-        if (durable && node->isDurable()) {
+        if (wasSpecified(DURABLE) && node->isDurable()) {
             pn_data_put_symbol(data, convert(DURABLE));
             pn_data_put_bool(data, true);
         }
@@ -187,9 +190,9 @@ void NodeProperties::write(pn_data_t* data, boost::shared_ptr<Exchange> node)
             pn_data_put_symbol(data, convert(ALTERNATE_EXCHANGE));
             pn_data_put_string(data, convert(node->getAlternate()->getName()));
         }
-        if (autoDelete) {
+        if (wasSpecified(AUTO_DELETE)) {
             pn_data_put_symbol(data, convert(AUTO_DELETE));
-            pn_data_put_bool(data, autoDelete);
+            pn_data_put_bool(data, node->isAutoDelete());
         }
 
         for (qpid::types::Variant::Map::const_iterator i = properties.begin(); i != properties.end(); ++i) {
@@ -312,14 +315,23 @@ void NodeProperties::onTimestampValue(const CharSequence& key, int64_t value, co
     process(key.str(), value, d);
 }
 
+namespace {
+qpid::types::Variant utf8(const std::string& s)
+{
+    qpid::types::Variant v(s);
+    v.setEncoding(qpid::types::encodings::UTF8);
+    return v;
+}
+}
+
 void NodeProperties::onStringValue(const CharSequence& key, const CharSequence& value, const Descriptor* d)
 {
-    process(key.str(), value.str(), d);
+    process(key.str(), utf8(value.str()), d);
 }
 
 void NodeProperties::onSymbolValue(const CharSequence& key, const CharSequence& value, const Descriptor* d)
 {
-    process(key.str(), value.str(), d);
+    process(key.str(), utf8(value.str()), d);
 }
 
 QueueSettings NodeProperties::getQueueSettings()
@@ -353,6 +365,10 @@ bool NodeProperties::isAutodelete() const
 std::string NodeProperties::getExchangeType() const
 {
     return exchangeType;
+}
+std::string NodeProperties::getSpecifiedExchangeType() const
+{
+    return wasSpecified(EXCHANGE_TYPE) ? exchangeType : EMPTY;
 }
 std::string NodeProperties::getAlternateExchange() const
 {

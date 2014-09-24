@@ -165,8 +165,7 @@ struct Options : public qpid::Options
             if (address.empty()) throw qpid::Exception("Address must be specified!");
             qpid::log::Logger::instance().configure(log);
             if (help) {
-                std::ostringstream msg;
-                std::cout << msg << *this << std::endl << std::endl
+                std::cout << *this << std::endl << std::endl
                           << "Drains messages from the specified address" << std::endl;
                 return false;
             } else {
@@ -241,8 +240,8 @@ class GetlineContentGenerator : public ContentGenerator {
   public:
     virtual bool setContent(Message& msg) {
         string content;
-        bool got = getline(std::cin, content);
-        if (got) msg.setContent(content);
+        bool got = !!getline(std::cin, content);
+        if (got) msg.setContentObject(content);
         return got;
     }
 };
@@ -251,7 +250,7 @@ class FixedContentGenerator   : public ContentGenerator {
   public:
     FixedContentGenerator(const string& s) : content(s) {}
     virtual bool setContent(Message& msg) {
-        msg.setContent(content);
+        msg.setContentObject(content);
         return true;
     }
   private:
@@ -349,8 +348,8 @@ using qpid::tests::EOS;
 int main(int argc, char ** argv)
 {
     Connection connection;
-    Options opts;
     try {
+        Options opts;
         if (opts.parse(argc, argv)) {
              connection = Connection(opts.url, opts.connectionOptions);
             connection.open();

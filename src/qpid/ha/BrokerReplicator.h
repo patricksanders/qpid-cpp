@@ -75,10 +75,11 @@ class BrokerReplicator : public broker::Exchange,
   public:
     typedef boost::shared_ptr<QueueReplicator> QueueReplicatorPtr;
 
-    BrokerReplicator(HaBroker&, const boost::shared_ptr<broker::Link>&);
+    static boost::shared_ptr<BrokerReplicator> create(
+        HaBroker&, const boost::shared_ptr<broker::Link>&);
+
     ~BrokerReplicator();
 
-    void initialize();          // Must be called  immediately after constructor.
     void shutdown();
 
     // Exchange methods
@@ -90,21 +91,22 @@ class BrokerReplicator : public broker::Exchange,
     bool hasBindings();
 
     // ConnectionObserver methods
-    void connection(broker::Connection&) {}
-    void opened(broker::Connection&) {}
-    void closed(broker::Connection& c) { if (link && &c == connect) disconnected(); }
-    void forced(broker::Connection& c, const std::string& /*message*/) { closed(c); }
+    void connection(broker::Connection&);
+    void opened(broker::Connection&);
+    void closed(broker::Connection&);
+    void forced(broker::Connection&, const std::string& /*message*/);
 
     QueueReplicatorPtr findQueueReplicator(const std::string& qname);
 
   private:
+    BrokerReplicator(HaBroker&, const boost::shared_ptr<broker::Link>&);
+    void initialize();          // Called in create()
+
     typedef std::pair<boost::shared_ptr<broker::Queue>, bool> CreateQueueResult;
     typedef std::pair<boost::shared_ptr<broker::Exchange>, bool> CreateExchangeResult;
 
     typedef void (BrokerReplicator::*DispatchFunction)(types::Variant::Map&);
     typedef qpid::sys::unordered_map<std::string, DispatchFunction> EventDispatchMap;
-
-    typedef qpid::sys::unordered_map<std::string, QueueReplicatorPtr> QueueReplicatorMap;
 
     class UpdateTracker;
     class ErrorListener;
@@ -148,7 +150,7 @@ class BrokerReplicator : public broker::Exchange,
     void deleteQueue(const std::string& name, bool purge=true);
     void deleteExchange(const std::string& name);
 
-    void disconnectedExchange(boost::shared_ptr<broker::Exchange>);
+    void disconnectedQueueReplicator(const boost::shared_ptr<QueueReplicator>&);
     void disconnected();
 
     void setMembership(const types::Variant::List&); // Set membership from list.

@@ -41,11 +41,11 @@ SessionContext::~SessionContext()
     pn_session_free(session);
 }
 
-boost::shared_ptr<SenderContext> SessionContext::createSender(const qpid::messaging::Address& address)
+boost::shared_ptr<SenderContext> SessionContext::createSender(const qpid::messaging::Address& address, bool setToOnSend)
 {
     std::string name = AddressHelper::getLinkName(address);
     if (senders.find(name) != senders.end()) throw LinkError("Link name must be unique within the scope of the connection");
-    boost::shared_ptr<SenderContext> s(new SenderContext(session, name, address));
+    boost::shared_ptr<SenderContext> s(new SenderContext(session, name, address, setToOnSend));
     senders[name] = s;
     return s;
 }
@@ -89,8 +89,14 @@ void SessionContext::removeSender(const std::string& n)
     senders.erase(n);
 }
 
-boost::shared_ptr<ReceiverContext> SessionContext::nextReceiver(qpid::messaging::Duration /*timeout*/)
+boost::shared_ptr<ReceiverContext> SessionContext::nextReceiver()
 {
+    for (SessionContext::ReceiverMap::iterator i = receivers.begin(); i != receivers.end(); ++i) {
+        if (i->second->hasCurrent()) {
+            return i->second;
+        }
+    }
+
     return boost::shared_ptr<ReceiverContext>();
 }
 

@@ -75,14 +75,16 @@ void SessionHandle::close()
     connection->endSession(session);
 }
 
-void SessionHandle::sync(bool /*block*/)
+void SessionHandle::sync(bool block)
 {
-    
+    if (block) {
+        connection->sync(session);
+    }
 }
 
 qpid::messaging::Sender SessionHandle::createSender(const qpid::messaging::Address& address)
 {
-    boost::shared_ptr<SenderContext> sender = session->createSender(address);
+    boost::shared_ptr<SenderContext> sender = session->createSender(address, connection->setToOnSend);
     try {
         connection->attach(session, sender);
         return qpid::messaging::Sender(new SenderHandle(connection, session, sender));
@@ -106,7 +108,7 @@ qpid::messaging::Receiver SessionHandle::createReceiver(const qpid::messaging::A
 
 bool SessionHandle::nextReceiver(Receiver& receiver, Duration timeout)
 {
-    boost::shared_ptr<ReceiverContext> r = session->nextReceiver(timeout);
+    boost::shared_ptr<ReceiverContext> r = connection->nextReceiver(session, timeout);
     if (r) {
         //TODO: cache handles in this case to avoid frequent allocation
         receiver = qpid::messaging::Receiver(new ReceiverHandle(connection, session, r));

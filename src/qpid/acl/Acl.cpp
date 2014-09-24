@@ -55,7 +55,8 @@ namespace _qmf = qmf::org::apache::qpid::acl;
 
 Acl::Acl (AclValues& av, Broker& b): aclValues(av), broker(&b), transferAcl(false),
     connectionCounter(new ConnectionCounter(*this, aclValues.aclMaxConnectPerUser, aclValues.aclMaxConnectPerIp, aclValues.aclMaxConnectTotal)),
-    resourceCounter(new ResourceCounter(*this, aclValues.aclMaxQueuesPerUser)){
+    resourceCounter(new ResourceCounter(*this, aclValues.aclMaxQueuesPerUser)),userRules(false)
+{
 
     if (aclValues.aclMaxConnectPerUser > AclData::getConnectMaxSpec())
         throw Exception("--connection-limit-per-user switch cannot be larger than " + AclData::getMaxConnectSpecStr());
@@ -77,10 +78,16 @@ Acl::Acl (AclValues& av, Broker& b): aclValues(av), broker(&b), transferAcl(fals
         mgmtObject->set_maxConnectionsPerUser(aclValues.aclMaxConnectPerUser);
         mgmtObject->set_maxQueuesPerUser(aclValues.aclMaxQueuesPerUser);
     }
-    std::string errorString;
-    if (!readAclFile(errorString)){
-        if (mgmtObject!=0) mgmtObject->set_enforcingAcl(0);
-        throw Exception("Could not read ACL file " + errorString);
+
+    if (!aclValues.aclFile.empty()) {
+        std::string errorString;
+        if (!readAclFile(errorString)){
+            if (mgmtObject!=0) mgmtObject->set_enforcingAcl(0);
+            throw Exception("Could not read ACL file " + errorString);
+        }
+    } else {
+        loadEmptyAclRuleset();
+        QPID_LOG(debug, "ACL loaded empty rule set");
     }
     broker->getConnectionObservers().add(connectionCounter);
     QPID_LOG(info, "ACL Plugin loaded");
@@ -255,6 +262,7 @@ bool Acl::readAclFile(std::string& aclFile, std::string& errorText) {
         data = d;
     }
     transferAcl = data->transferAcl; // any transfer ACL
+    userRules = true; // rules in force came from an ACL file
 
     if (data->transferAcl){
         QPID_LOG(debug,"ACL: Transfer ACL is Enabled!");
@@ -280,6 +288,29 @@ bool Acl::readAclFile(std::string& aclFile, std::string& errorText) {
     return true;
 }
 
+//
+// loadEmptyAclRuleset()
+//
+// No ACL file is specified but ACL should run.
+// Create a ruleset as if only "ACL ALLOW ALL ALL" was in a file
+//
+void Acl::loadEmptyAclRuleset() {
+    boost::shared_ptr<AclData> d(new AclData);
+    d->decisionMode = ALLOW;
+    d->aclSource = "";
+    {
+        Mutex::ScopedLock locker(dataLock);
+        data = d;
+    }
+    if (mgmtObject!=0){
+        mgmtObject->set_transferAcl(transferAcl?1:0);
+        mgmtObject->set_policyFile("");
+        sys::AbsTime now = sys::AbsTime::now();
+        int64_t ns = sys::Duration(sys::EPOCH, now);
+        mgmtObject->set_lastAclLoad(ns);
+        agent->raiseEvent(_qmf::EventFileLoaded(""));
+    }
+}
 
 //
 // management lookup function performs general query on acl engine

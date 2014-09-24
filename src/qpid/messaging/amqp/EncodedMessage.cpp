@@ -145,7 +145,7 @@ void EncodedMessage::populate(qpid::types::Variant::Map& map) const
             map["x-amqp-group-id"] = groupId.str();
         }
         if (!!groupSequence) {
-            map["x-amqp-qroup-sequence"] = groupSequence.get();
+            map["x-amqp-group-sequence"] = groupSequence.get();
         }
         if (replyToGroupId) {
             map["x-amqp-reply-to-group-id"] = replyToGroupId.str();
@@ -229,7 +229,8 @@ void EncodedMessage::getBody(std::string& raw, qpid::types::Variant& c) const
                 c = builder.getList();
                 raw.assign(body.data, body.size);
             } else if (bodyType == qpid::amqp::typecodes::MAP_NAME) {
-                qpid::amqp::DataBuilder builder = qpid::amqp::DataBuilder(qpid::types::Variant::Map());
+                qpid::types::Variant v = qpid::types::Variant::Map();
+                qpid::amqp::DataBuilder builder(v);
                 qpid::amqp::Decoder decoder(body.data, body.size);
                 decoder.read(builder);
                 c = builder.getValue().asMap();

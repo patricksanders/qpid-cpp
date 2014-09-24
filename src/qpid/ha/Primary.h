@@ -25,6 +25,7 @@
 #include "types.h"
 #include "hash.h"
 #include "BrokerInfo.h"
+#include "PrimaryQueueLimits.h"
 #include "ReplicationTest.h"
 #include "Role.h"
 #include "qpid/sys/Mutex.h"
@@ -41,6 +42,7 @@ class Queue;
 class Connection;
 class ConnectionObserver;
 class BrokerObserver;
+class SessionHandlerObserver;
 class TxBuffer;
 class DtxBuffer;
 }
@@ -125,7 +127,6 @@ class Primary : public Role
     RemoteBackupPtr backupConnect(const BrokerInfo&, broker::Connection&, sys::Mutex::ScopedLock&);
     void backupDisconnect(RemoteBackupPtr, sys::Mutex::ScopedLock&);
 
-    void initializeQueue(boost::shared_ptr<broker::Queue>);
     void checkReady();
     void checkReady(RemoteBackupPtr);
     void setCatchupQueues(const RemoteBackupPtr&, bool createGuards);
@@ -152,9 +153,11 @@ class Primary : public Role
     BackupMap backups;
     boost::shared_ptr<broker::ConnectionObserver> connectionObserver;
     boost::shared_ptr<broker::BrokerObserver> brokerObserver;
+    boost::shared_ptr<broker::SessionHandlerObserver> sessionHandlerObserver;
     boost::intrusive_ptr<sys::TimerTask> timerTask;
     ReplicaMap replicas;
     TxMap txMap;
+    PrimaryQueueLimits queueLimits;
 };
 }} // namespace qpid::ha
 

@@ -19,26 +19,18 @@
  *
  */
 
-#ifndef QPID_LEGACYSTORE_MESSAGESTOREIMPL_H
-#define QPID_LEGACYSTORE_MESSAGESTOREIMPL_H
+#ifndef QPID_LINEARSTORE_MESSAGESTOREIMPL_H
+#define QPID_LINEARSTORE_MESSAGESTOREIMPL_H
 
 #include <iomanip>
-#include <string>
-
-#include "db-inc.h"
-#include "qpid/linearstore/Cursor.h"
-#include "qpid/linearstore/IdDbt.h"
-#include "qpid/linearstore/IdSequence.h"
-#include "qpid/linearstore/JournalImpl.h"
-#include "qpid/linearstore/JournalLogImpl.h"
-#include "qpid/linearstore/jrnl/jcfg.h"
-#include "qpid/linearstore/jrnl/EmptyFilePoolTypes.h"
-#include "qpid/linearstore/PreparedTransaction.h"
-#include "qpid/broker/Broker.h"
 #include "qpid/broker/MessageStore.h"
-#include "qpid/management/Manageable.h"
+#include "qpid/linearstore/IdSequence.h"
+#include "qpid/linearstore/JournalLogImpl.h"
+#include "qpid/linearstore/journal/jcfg.h"
+#include "qpid/linearstore/journal/EmptyFilePoolTypes.h"
+#include "qpid/linearstore/PreparedTransaction.h"
+
 #include "qmf/org/apache/qpid/linearstore/Store.h"
-#include "qpid/linearstore/TxnCtxt.h"
 
 // Assume DB_VERSION_MAJOR == 4
 #if (DB_VERSION_MINOR == 2)
@@ -46,15 +38,28 @@
 #define DB_BUFFER_SMALL ENOMEM
 #endif
 
-namespace qpid { namespace sys {
-class Timer;
-}}
+class Db;
+class DbEnv;
+class Dbt;
+class DbTxn;
 
-namespace qpid{
-namespace qls_jrnl {
-class EmptyFilePoolManager;
+namespace qpid {
+namespace broker {
+    class Broker;
+}
+namespace sys {
+    class Timer;
 }
 namespace linearstore{
+namespace journal {
+    class EmptyFilePool;
+    class EmptyFilePoolManager;
+}
+
+class IdDbt;
+class JournalImpl;
+class TplJournalImpl;
+class TxnCtxt;
 
 /**
  * An implementation of the MessageStore interface based on Berkeley DB
@@ -84,19 +89,6 @@ class MessageStoreImpl : public qpid::broker::MessageStore, public qpid::managem
     typedef LockedMappings::map txn_lock_map;
     typedef boost::ptr_list<PreparedTransaction> txn_list;
 
-    // Structs for Transaction Recover List (TPL) recover state
-    struct TplRecoverStruct {
-        uint64_t rid; // rid of TPL record
-        bool deq_flag;
-        bool commit_flag;
-        bool tpc_flag;
-        TplRecoverStruct(const uint64_t _rid, const bool _deq_flag, const bool _commit_flag, const bool _tpc_flag);
-    };
-    typedef TplRecoverStruct TplRecover;
-    typedef std::pair<std::string, TplRecover> TplRecoverMapPair;
-    typedef std::map<std::string, TplRecover> TplRecoverMap;
-    typedef TplRecoverMap::const_iterator TplRecoverMapCitr;
-
     typedef std::map<std::string, JournalImpl*> JournalListMap;
     typedef JournalListMap::iterator JournalListMapItr;
 
@@ -122,7 +114,6 @@ class MessageStoreImpl : public qpid::broker::MessageStore, public qpid::managem
 
     // Pointer to Transaction Prepared List (TPL) journal instance
     boost::shared_ptr<TplJournalImpl> tplStorePtr;
-    TplRecoverMap tplRecoverMap;
     qpid::sys::Mutex tplInitLock;
     JournalListMap journalList;
     qpid::sys::Mutex journalListLock;
@@ -133,8 +124,8 @@ class MessageStoreImpl : public qpid::broker::MessageStore, public qpid::managem
     IdSequence generalIdSequence;
     IdSequence messageIdSequence;
     std::string storeDir;
-    qpid::qls_jrnl::efpPartitionNumber_t defaultEfpPartitionNumber;
-    qpid::qls_jrnl::efpDataSize_kib_t defaultEfpFileSize_kib;
+    qpid::linearstore::journal::efpPartitionNumber_t defaultEfpPartitionNumber;
+    qpid::linearstore::journal::efpDataSize_kib_t defaultEfpFileSize_kib;
     bool      truncateFlag;
     uint32_t wCachePgSizeSblks;
     uint16_t wCacheNumPages;
@@ -145,7 +136,7 @@ class MessageStoreImpl : public qpid::broker::MessageStore, public qpid::managem
     const char* envPath;
     qpid::broker::Broker* broker;
     JournalLogImpl jrnlLog;
-    boost::shared_ptr<qpid::qls_jrnl::EmptyFilePoolManager> efpMgr;
+    boost::shared_ptr<qpid::linearstore::journal::EmptyFilePoolManager> efpMgr;
 
     qmf::org::apache::qpid::linearstore::Store::shared_ptr mgmtObject;
     qpid::management::ManagementAgent* agent;
@@ -156,9 +147,9 @@ class MessageStoreImpl : public qpid::broker::MessageStore, public qpid::managem
                                            const std::string& paramName/*,
                                            const uint16_t jrnlFsizePgs*/);
     static uint16_t getJrnlWrNumPages(const uint32_t wrPageSizeKiB);
-    static qpid::qls_jrnl::efpPartitionNumber_t chkEfpPartition(const qpid::qls_jrnl::efpPartitionNumber_t partition,
+    static qpid::linearstore::journal::efpPartitionNumber_t chkEfpPartition(const qpid::linearstore::journal::efpPartitionNumber_t partition,
                                                                 const std::string& paramName);
-    static qpid::qls_jrnl::efpDataSize_kib_t chkEfpFileSizeKiB(const qpid::qls_jrnl::efpDataSize_kib_t efpFileSizeKiB,
+    static qpid::linearstore::journal::efpDataSize_kib_t chkEfpFileSizeKiB(const qpid::linearstore::journal::efpDataSize_kib_t efpFileSizeKiB,
                                                               const std::string& paramName);
 
     void init();
@@ -197,7 +188,6 @@ class MessageStoreImpl : public qpid::broker::MessageStore, public qpid::managem
                        queue_index& index,
                        txn_list& locked,
                        message_index& prepared);
-    void readTplStore();
     void recoverTplStore();
     void recoverLockedMappings(txn_list& txns);
     TxnCtxt* check(qpid::broker::TransactionContext* ctxt);
@@ -233,8 +223,8 @@ class MessageStoreImpl : public qpid::broker::MessageStore, public qpid::managem
     // journal functions
     void createJrnlQueue(const qpid::broker::PersistableQueue& queue);
     std::string getJrnlDir(const std::string& queueName);
-    qpid::qls_jrnl::EmptyFilePool* getEmptyFilePool(const qpid::qls_jrnl::efpPartitionNumber_t p, const qpid::qls_jrnl::efpDataSize_kib_t s);
-    qpid::qls_jrnl::EmptyFilePool* getEmptyFilePool(const qpid::framing::FieldTable& args);
+    qpid::linearstore::journal::EmptyFilePool* getEmptyFilePool(const qpid::linearstore::journal::efpPartitionNumber_t p, const qpid::linearstore::journal::efpDataSize_kib_t s);
+    qpid::linearstore::journal::EmptyFilePool* getEmptyFilePool(const qpid::framing::FieldTable& args);
     std::string getStoreTopLevelDir();
     std::string getJrnlBaseDir();
     std::string getBdbBaseDir();
@@ -244,19 +234,6 @@ class MessageStoreImpl : public qpid::broker::MessageStore, public qpid::managem
         if (!isInit) { init("/tmp"); isInit = true; }
     }
     void chkTplStoreInit();
-
-    // debug aid for printing XIDs that may contain non-printable chars
-    static std::string xid2str(const std::string xid) {
-        std::ostringstream oss;
-        oss << std::hex << std::setfill('0');
-        for (unsigned i=0; i<xid.size(); i++) {
-            if (isprint(xid[i]))
-                oss << xid[i];
-            else
-                oss << "/" << std::setw(2) << (int)((char)xid[i]);
-        }
-        return oss.str();
-    }
 
   public:
     typedef boost::shared_ptr<MessageStoreImpl> shared_ptr;
@@ -268,8 +245,8 @@ class MessageStoreImpl : public qpid::broker::MessageStore, public qpid::managem
     bool init(const qpid::Options* options);
 
     bool init(const std::string& dir,
-              qpid::qls_jrnl::efpPartitionNumber_t efpPartition = defEfpPartition,
-              qpid::qls_jrnl::efpDataSize_kib_t efpFileSizeKib = defEfpFileSizeKib,
+              qpid::linearstore::journal::efpPartitionNumber_t efpPartition = defEfpPartition,
+              qpid::linearstore::journal::efpDataSize_kib_t efpFileSizeKib = defEfpFileSizeKib,
               const bool truncateFlag = false,
               uint32_t wCachePageSize = defWCachePageSizeKib,
               uint32_t tplWCachePageSize = defTplWCachePageSizeKib);
@@ -365,4 +342,4 @@ class MessageStoreImpl : public qpid::broker::MessageStore, public qpid::managem
 } // namespace msgstore
 } // namespace mrg
 
-#endif // ifndef QPID_LEGACYSTORE_MESSAGESTOREIMPL_H
+#endif // ifndef QPID_LINEARSTORE_MESSAGESTOREIMPL_H

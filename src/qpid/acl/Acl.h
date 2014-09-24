@@ -67,6 +67,7 @@ private:
     mutable qpid::sys::Mutex             dataLock;
     boost::shared_ptr<ConnectionCounter> connectionCounter;
     boost::shared_ptr<ResourceCounter>   resourceCounter;
+    bool                                 userRules;
 
 public:
     Acl (AclValues& av, broker::Broker& b);
@@ -83,6 +84,10 @@ public:
 
     inline virtual uint16_t getMaxConnectTotal() {
         return aclValues.aclMaxConnectTotal;
+    };
+
+    inline virtual bool userAclRules() {
+      return userRules;
     };
 
 // create specilied authorise methods for cases that need faster matching as needed.
@@ -115,6 +120,7 @@ private:
         const std::string& name);
     bool readAclFile(std::string& errorText);
     bool readAclFile(std::string& aclFile, std::string& errorText);
+    void loadEmptyAclRuleset();
     Manageable::status_t lookup       (management::Args& args, std::string& text);
     Manageable::status_t lookupPublish(management::Args& args, std::string& text);
     virtual qpid::management::ManagementObject::shared_ptr GetManagementObject(void) const;

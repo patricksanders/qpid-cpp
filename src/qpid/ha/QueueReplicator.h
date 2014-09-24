@@ -38,6 +38,7 @@ class Queue;
 class QueueRegistry;
 class SessionHandler;
 class Deliverable;
+class ExchangeRegistry;
 }
 
 namespace ha {
@@ -45,11 +46,13 @@ class HaBroker;
 class Settings;
 
 /**
- * Exchange created on a backup broker to replicate a queue on the primary.
+ * Exchange created on a backup broker to receive replicated messages and
+ * replication events from a queue on the primary. It subscribes to the primary
+ * queue via a ReplicatingSubscription on the primary by passing special
+ * arguments to the subscribe command.
  *
- * Puts replicated messages on the local queue, handles dequeue events.
- * Creates a ReplicatingSubscription on the primary by passing special
- * arguments to the consume command.
+ * It puts replicated messages on the local replica queue and handles dequeue
+ * events by removing local messages.
  *
  * THREAD SAFE: Called in different connection threads.
  */
@@ -59,30 +62,28 @@ class QueueReplicator : public broker::Exchange,
   public:
     static const std::string QPID_SYNC_FREQUENCY;
     static const std::string REPLICATOR_PREFIX;
+    typedef std::vector<boost::shared_ptr<QueueReplicator> > Vector;
 
     static std::string replicatorName(const std::string& queueName);
     static bool isReplicatorName(const std::string&);
+    /*** Copy QueueReplicators from the registry */
+    static void copy(broker::ExchangeRegistry&, Vector& result);
 
-    QueueReplicator(HaBroker&,
-                    boost::shared_ptr<broker::Queue> q,
-                    boost::shared_ptr<broker::Link> l);
+    static boost::shared_ptr<QueueReplicator> create(
+        HaBroker&, boost::shared_ptr<broker::Queue> q, boost::shared_ptr<broker::Link> l);
 
     ~QueueReplicator();
 
-    void activate();        // Must be called immediately after constructor.
     void disconnect();      // Called when we are disconnected from the primary.
 
-    std::string getType() const;
+    virtual std::string getType() const;
 
     void route(broker::Deliverable&);
 
     // Set if the queue has ever been subscribed to, used for auto-delete cleanup.
     void setSubscribed() { subscribed = true; }
-    bool isSubscribed() { return subscribed; }
 
     boost::shared_ptr<broker::Queue> getQueue() const { return queue; }
-
-    ReplicationId getMaxId();
 
     // No-op unused Exchange virtual functions.
     bool bind(boost::shared_ptr<broker::Queue>, const std::string&, const framing::FieldTable*);
@@ -90,19 +91,28 @@ class QueueReplicator : public broker::Exchange,
     bool isBound(boost::shared_ptr<broker::Queue>, const std::string* const, const framing::FieldTable* const);
     bool hasBindings();
 
+    void promoted();
+
   protected:
     typedef boost::function<void(const std::string&, sys::Mutex::ScopedLock&)> DispatchFn;
     typedef qpid::sys::unordered_map<std::string, DispatchFn> DispatchMap;
 
+    QueueReplicator(
+        HaBroker&, boost::shared_ptr<broker::Queue>, boost::shared_ptr<broker::Link>);
+
+    void initialize();          // Called as part of create()
+
     virtual void deliver(const broker::Message&);
+
     virtual void destroy();             // Called when the queue is destroyed.
+    virtual void destroy(sys::Mutex::ScopedLock&);
 
     sys::Mutex lock;
     HaBroker& haBroker;
     const BrokerInfo brokerInfo;
     DispatchMap dispatch;
     boost::shared_ptr<broker::Link> link;
-    boost::shared_ptr<broker::Bridge> bridge;
+    boost::weak_ptr<broker::Bridge> bridge;
     boost::shared_ptr<broker::Queue> queue;
     broker::SessionHandler* sessionHandler;
 
@@ -118,8 +128,7 @@ class QueueReplicator : public broker::Exchange,
     void dequeueEvent(const std::string& data, sys::Mutex::ScopedLock&);
     void idEvent(const std::string& data, sys::Mutex::ScopedLock&);
 
-    void incomingExecutionException(framing::execution::ErrorCode e,
-                                    const std::string& msg);
+    bool deletedOnPrimary(framing::execution::ErrorCode e, const std::string& msg);
 
     std::string logPrefix;
     std::string bridgeName;
