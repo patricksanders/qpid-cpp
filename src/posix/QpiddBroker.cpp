@@ -27,21 +27,24 @@
 #include "qpid/log/Logger.h"
 
 #include <iostream>
+#include <fstream>
 #include <signal.h>
 #include <unistd.h>
 #include <sys/utsname.h>
 
 using std::cout;
 using std::endl;
+using std::ifstream;
+using std::ofstream;
 
 namespace qpid {
 namespace broker {
 
 BootstrapOptions::BootstrapOptions(const char* argv0)
-  : qpid::Options("Options"),
-    common("", QPIDD_CONF_FILE, QPIDC_CONF_FILE),
-    module(QPIDD_MODULE_DIR),
-    log(argv0)
+    : qpid::Options("Options"),
+      common("", QPIDD_CONF_FILE, QPIDC_CONF_FILE),
+      module(QPIDD_MODULE_DIR),
+      log(argv0)
 {
     add(common);
     add(module);
@@ -59,12 +62,15 @@ const std::string TCP = "tcp";
 struct DaemonOptions : public qpid::Options {
     bool daemon;
     bool quit;
+    bool kill;
     bool check;
+    std::vector<int> closeFd;
     int wait;
     std::string piddir;
+    std::string pidfile;
     std::string transport;
 
-    DaemonOptions() : qpid::Options("Daemon options"), daemon(false), quit(false), check(false), wait(600), transport(TCP)
+    DaemonOptions() : qpid::Options("Daemon options"), daemon(false), quit(false), kill(false), check(false), wait(600), transport(TCP)
     {
         char *home = ::getenv("HOME");
 
@@ -78,9 +84,12 @@ struct DaemonOptions : public qpid::Options {
             ("daemon,d", pure_switch(daemon), "Run as a daemon. Logs to syslog by default in this mode.")
             ("transport", optValue(transport, "TRANSPORT"), "The transport for which to return the port")
             ("pid-dir", optValue(piddir, "DIR"), "Directory where port-specific PID file is stored")
+            ("pidfile", optValue(pidfile, "FILE"), "File name to store the PID in daemon mode. Used as-is, no directory or suffixes added.")
+            ("close-fd", optValue(closeFd, "FD"), "File descriptors that the daemon should close")
             ("wait,w", optValue(wait, "SECONDS"), "Sets the maximum wait time to initialize or shutdown the daemon. If the daemon fails to initialize/shutdown, prints an error and returns 1")
             ("check,c", pure_switch(check), "Prints the daemon's process ID to stdout and returns 0 if the daemon is running, otherwise returns 1")
-            ("quit,q", pure_switch(quit), "Tells the daemon to shut down");
+            ("quit,q", pure_switch(quit), "Tells the daemon to shut down with an INT signal")
+            ("kill,k", pure_switch(kill), "Kill the daemon with a KILL signal.");
     }
 };
 
@@ -94,10 +103,10 @@ struct QpiddPosixOptions : public QpiddOptionsPrivate {
 };
 
 QpiddOptions::QpiddOptions(const char* argv0)
-  : qpid::Options("Options"),
-    common("", QPIDD_CONF_FILE, QPIDC_CONF_FILE),
-    module(QPIDD_MODULE_DIR),
-    log(argv0)
+    : qpid::Options("Options"),
+      common("", QPIDD_CONF_FILE, QPIDC_CONF_FILE),
+      module(QPIDD_MODULE_DIR),
+      log(argv0)
 {
     add(common);
     add(module);
@@ -123,21 +132,36 @@ struct ScopedSetBroker {
     ~ScopedSetBroker() { qpid::broker::SignalHandler::setBroker(0); }
 };
 
+namespace {
+
+/// Write a pid file if requested
+void writePid(const std::string& filename) {
+    if (!filename.empty()) {
+        ofstream pidfile(filename.c_str());
+        pidfile << ::getpid() << endl;
+        pidfile.close();
+    }
+}
+}
+
 struct QpiddDaemon : public Daemon {
     QpiddPosixOptions *options;
 
     QpiddDaemon(std::string pidDir, QpiddPosixOptions *opts)
-      : Daemon(pidDir), options(opts) {}
+        : Daemon(pidDir), options(opts) {}
 
     /** Code for parent process */
     void parent() {
         uint16_t port = wait(options->daemon.wait);
-        if (options->parent->broker.port == 0
-        ) cout << port << endl;
+        if (options->parent->broker.port == 0)
+            cout << port << endl;
     }
 
     /** Code for forked child process */
     void child() {
+        // Close extra FDs requested in options.
+        for (size_t i = 0; i < options->daemon.closeFd.size(); ++i)
+            ::close(options->daemon.closeFd[i]);
         boost::intrusive_ptr<Broker> brokerPtr(new Broker(options->parent->broker));
         ScopedSetBroker ssb(brokerPtr);
         brokerPtr->accept();
@@ -146,6 +170,7 @@ struct QpiddDaemon : public Daemon {
         if (options->parent->broker.enableMgmt && (options->parent->broker.port == 0 || options->daemon.transport != TCP)) {
             boost::dynamic_pointer_cast<qmf::org::apache::qpid::broker::Broker>(brokerPtr->GetManagementObject())->set_port(port);
         }
+        writePid(options->daemon.pidfile);
         brokerPtr->run();
     }
 };
@@ -153,25 +178,33 @@ struct QpiddDaemon : public Daemon {
 int QpiddBroker::execute (QpiddOptions *options) {
     // Options that affect a running daemon.
     QpiddPosixOptions *myOptions =
-      static_cast<QpiddPosixOptions *>(options->platform.get());
+        static_cast<QpiddPosixOptions *>(options->platform.get());
     if (myOptions == 0)
         throw Exception("Internal error obtaining platform options");
 
-    if (myOptions->daemon.check || myOptions->daemon.quit) {
-        pid_t pid;
-        try {
-            pid = Daemon::getPid(myOptions->daemon.piddir, options->broker.port);
-        } catch (const ErrnoException& e) {
-            // This is not a critical error, usually means broker is not running
-            QPID_LOG(notice, "Cannot stop broker: " << e.what());
-            return 1;
+    if (myOptions->daemon.check || myOptions->daemon.quit || myOptions->daemon.kill) {
+        pid_t pid = 0;
+        if (!myOptions->daemon.pidfile.empty()) {
+            ifstream pidfile(myOptions->daemon.pidfile.c_str());
+            pidfile >> pid;
+            pidfile.close();
+        }
+        if (pid == 0) {
+            try {
+                pid = Daemon::getPid(myOptions->daemon.piddir, options->broker.port);
+            } catch (const Exception& e) {
+                // This is not a critical error, usually means broker is not running
+                QPID_LOG(notice, "Broker is not running: " << e.what());
+                return 1;
+            }
         }
         if (pid < 0)
             return 1;
         if (myOptions->daemon.check)
             cout << pid << endl;
-        if (myOptions->daemon.quit) {
-            if (kill(pid, SIGINT) < 0)
+        if (myOptions->daemon.quit || myOptions->daemon.kill) {
+            int signal = myOptions->daemon.kill ? SIGKILL : SIGINT;
+            if (kill(pid, signal) < 0)
                 throw Exception("Failed to stop daemon: " + qpid::sys::strError(errno));
             // Wait for the process to die before returning
             int retry=myOptions->daemon.wait*1000;    // Try up to "--wait N" seconds, do retry every millisecond
@@ -203,6 +236,7 @@ int QpiddBroker::execute (QpiddOptions *options) {
                 boost::dynamic_pointer_cast<qmf::org::apache::qpid::broker::Broker>(brokerPtr->GetManagementObject())->set_port(port);
             }
         }
+        writePid(myOptions->daemon.pidfile);
         brokerPtr->run();
     }
     return 0;

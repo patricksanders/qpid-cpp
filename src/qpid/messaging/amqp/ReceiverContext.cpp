@@ -36,10 +36,11 @@ ReceiverContext::ReceiverContext(pn_session_t* session, const std::string& n, co
     address(a),
     helper(address),
     receiver(pn_receiver(session, name.c_str())),
-    capacity(0) {}
+    capacity(0), used(0) {}
+
 ReceiverContext::~ReceiverContext()
 {
-    //pn_link_free(receiver);
+    if (receiver) pn_link_free(receiver);
 }
 
 void ReceiverContext::setCapacity(uint32_t c)
@@ -63,12 +64,13 @@ uint32_t ReceiverContext::getAvailable()
 
 uint32_t ReceiverContext::getUnsettled()
 {
+    assert(pn_link_unsettled(receiver) >= pn_link_queued(receiver));
     return pn_link_unsettled(receiver) - pn_link_queued(receiver);
 }
 
 void ReceiverContext::close()
 {
-    pn_link_close(receiver);
+    if (receiver) pn_link_close(receiver);
 }
 
 const std::string& ReceiverContext::getName() const
@@ -96,7 +98,7 @@ void ReceiverContext::verify()
 }
 void ReceiverContext::configure()
 {
-    configure(pn_link_source(receiver));
+    if (receiver) configure(pn_link_source(receiver));
 }
 void ReceiverContext::configure(pn_terminus_t* source)
 {
@@ -116,13 +118,23 @@ Address ReceiverContext::getAddress() const
 
 void ReceiverContext::reset(pn_session_t* session)
 {
-    receiver = pn_receiver(session, name.c_str());
-    configure();
+    receiver = session ? pn_receiver(session, name.c_str()) : 0;
+    if (receiver) configure();
 }
 
 bool ReceiverContext::hasCurrent()
 {
-    return pn_link_current(receiver);
+    return receiver &&  pn_link_current(receiver);
+}
+
+bool ReceiverContext::wakeupToIssueCredit()
+{
+    if (++used >= (capacity/2)) {
+        used = 0;
+        return true;
+    } else {
+        return false;
+    }
 }
 
 }}} // namespace qpid::messaging::amqp

@@ -46,7 +46,7 @@ class ReceiverContext
 {
   public:
     ReceiverContext(pn_session_t* session, const std::string& name, const qpid::messaging::Address& source);
-    ~ReceiverContext();
+    virtual ~ReceiverContext();
     void reset(pn_session_t* session);
     void setCapacity(uint32_t);
     uint32_t getCapacity();
@@ -67,8 +67,10 @@ class ReceiverContext
     AddressHelper helper;
     pn_link_t* receiver;
     uint32_t capacity;
+    uint32_t used;
     qpid::sys::AtomicCount fetching;
     void configure(pn_terminus_t*);
+    bool wakeupToIssueCredit();
 };
 }}} // namespace qpid::messaging::amqp
 

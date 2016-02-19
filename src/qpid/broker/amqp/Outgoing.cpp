@@ -28,10 +28,12 @@
 #include "qpid/broker/TopicKeyNode.h"
 #include "qpid/sys/OutputControl.h"
 #include "qpid/amqp/descriptors.h"
+#include "qpid/amqp/Descriptor.h"
 #include "qpid/amqp/MessageEncoder.h"
 #include "qpid/framing/Buffer.h"
 #include "qpid/framing/reply_exceptions.h"
 #include "qpid/log/Statement.h"
+#include "config.h"
 
 namespace qpid {
 namespace broker {
@@ -59,11 +61,11 @@ bool requested_unreliable(pn_link_t* link)
 OutgoingFromQueue::OutgoingFromQueue(Broker& broker, const std::string& source, const std::string& target, boost::shared_ptr<Queue> q, pn_link_t* l, Session& session,
                                      qpid::sys::OutputControl& o, SubscriptionType type, bool e, bool p)
     : Outgoing(broker, session, source, target, pn_link_name(l)),
-      Consumer(pn_link_name(l), type),
+      Consumer(pn_link_name(l), type, target),
       exclusive(e),
       isControllingUser(p),
       queue(q), deliveries(5000), link(l), out(o),
-      current(0), outstanding(0),
+      current(0),
       buffer(1024)/*used only for header at present*/,
       //for exclusive queues, assume unreliable unless reliable is explicitly requested; otherwise assume reliable unless unreliable requested
       unreliable(exclusive ? !requested_reliable(link) : requested_unreliable(link)),
@@ -89,13 +91,13 @@ bool OutgoingFromQueue::doWork()
                 return true;
             } else {
                 pn_link_drained(link);
-                QPID_LOG(debug, "No message available on " << queue->getName());
+                QPID_LOG(trace, "No message available on " << queue->getName());
             }
         } catch (const qpid::framing::ResourceDeletedException& e) {
             throw Exception(qpid::amqp::error_conditions::RESOURCE_DELETED, e.what());
         }
     } else {
-        QPID_LOG(debug, "Can't deliver to " << getName() << " from " << queue->getName() << ": " << pn_link_credit(link));
+        QPID_LOG(trace, "Can't deliver to " << getName() << " from " << queue->getName() << ": " << pn_link_credit(link));
     }
     return false;
 }
@@ -109,31 +111,15 @@ void OutgoingFromQueue::handle(pn_delivery_t* delivery)
 {
     size_t i = Record::getIndex(pn_delivery_tag(delivery));
     Record& r = deliveries[i];
-    if (pn_delivery_writable(delivery)) {
-        assert(r.msg);
-        assert(!r.delivery);
-        r.delivery = delivery;
-        //write header
-        qpid::amqp::MessageEncoder encoder(&buffer[0], buffer.size());
-        encoder.writeHeader(Header(r.msg));
-        write(&buffer[0], encoder.getPosition());
-        Translation t(r.msg);
-        t.write(*this);
-        if (pn_link_advance(link)) {
-            if (unreliable) pn_delivery_settle(delivery);
-            --outstanding;
-            outgoingMessageSent();
-            QPID_LOG(debug, "Sent message " << r.msg.getSequence() << " from " << queue->getName() << ", index=" << r.index);
-        } else {
-            QPID_LOG(error, "Failed to send message " << r.msg.getSequence() << " from " << queue->getName() << ", index=" << r.index);
-        }
-    }
-    if (unreliable) {
-        if (preAcquires()) queue->dequeue(0, r.cursor);
-        r.reset();
-    } else if (pn_delivery_updated(delivery)) {
+    if (pn_delivery_updated(delivery)) {
         assert(r.delivery == delivery);
         r.disposition = pn_delivery_remote_state(delivery);
+
+        std::pair<TxBuffer*,uint64_t> txn = session.getTransactionalState(delivery);
+        if (txn.first) {
+            r.disposition = txn.second;
+        }
+
         if (!r.disposition && pn_delivery_settled(delivery)) {
             //if peer has settled without setting state, assume accepted
             r.disposition = PN_ACCEPTED;
@@ -141,7 +127,7 @@ void OutgoingFromQueue::handle(pn_delivery_t* delivery)
         if (r.disposition) {
             switch (r.disposition) {
               case PN_ACCEPTED:
-                if (preAcquires()) queue->dequeue(0, r.cursor);
+                if (preAcquires()) queue->dequeue(r.cursor, txn.first);
                 outgoingMessageAccepted();
                 break;
               case PN_REJECTED:
@@ -169,10 +155,10 @@ void OutgoingFromQueue::handle(pn_delivery_t* delivery)
 
 bool OutgoingFromQueue::canDeliver()
 {
-    return deliveries[current].delivery == 0 && pn_link_credit(link) > outstanding;
+    return deliveries[current].delivery == 0 && pn_link_credit(link);
 }
 
-void OutgoingFromQueue::detached()
+void OutgoingFromQueue::detached(bool closed)
 {
     QPID_LOG(debug, "Detaching outgoing link " << getName() << " from " << queue->getName());
     queue->cancel(shared_from_this());
@@ -180,11 +166,13 @@ void OutgoingFromQueue::detached()
     for (size_t i = 0 ; i < deliveries.capacity(); ++i) {
         if (deliveries[i].msg) queue->release(deliveries[i].cursor, true);
     }
-    if (exclusive) queue->releaseExclusiveOwnership();
-    else if (isControllingUser) queue->releaseFromUse(true);
+    if (exclusive) {
+        queue->releaseExclusiveOwnership(closed);
+    } else if (isControllingUser) {
+        queue->releaseFromUse(true);
+    }
     cancelled = true;
 }
-
 
 OutgoingFromQueue::~OutgoingFromQueue()
 {
@@ -198,9 +186,25 @@ bool OutgoingFromQueue::deliver(const QueueCursor& cursor, const qpid::broker::M
     if (current >= deliveries.capacity()) current = 0;
     r.cursor = cursor;
     r.msg = msg;
-    pn_delivery(link, r.tag);
+    r.delivery = pn_delivery(link, r.tag);
+    //write header
+    qpid::amqp::MessageEncoder encoder(&buffer[0], buffer.size());
+    encoder.writeHeader(Header(r.msg));
+    write(&buffer[0], encoder.getPosition());
+    Translation t(r.msg);
+    t.write(*this);
+    if (pn_link_advance(link)) {
+        if (unreliable) pn_delivery_settle(r.delivery);
+        outgoingMessageSent();
+        QPID_LOG(debug, "Sent message " << r.msg.getSequence() << " from " << queue->getName() << ", index=" << r.index);
+    } else {
+        QPID_LOG(error, "Failed to send message " << r.msg.getSequence() << " from " << queue->getName() << ", index=" << r.index);
+    }
+    if (unreliable) {
+        if (preAcquires()) queue->dequeue(0, r.cursor);
+        r.reset();
+    }
     QPID_LOG(debug, "Requested delivery of " << r.msg.getSequence() << " from " << queue->getName() << ", index=" << r.index);
-    ++outstanding;
     return true;
 }
 
@@ -283,7 +287,11 @@ qpid::broker::OwnershipToken* OutgoingFromQueue::getSession()
 
 OutgoingFromQueue::Record::Record() : delivery(0), disposition(0), index(0)
 {
+#ifdef NO_PROTON_DELIVERY_TAG_T
+    tag.start = tagData;
+#else
     tag.bytes = tagData;
+#endif
     tag.size = TAG_WIDTH;
 }
 void OutgoingFromQueue::Record::init(size_t i)
@@ -304,7 +312,11 @@ void OutgoingFromQueue::Record::reset()
 size_t OutgoingFromQueue::Record::getIndex(pn_delivery_tag_t t)
 {
     assert(t.size == TAG_WIDTH);
+#ifdef NO_PROTON_DELIVERY_TAG_T
+    qpid::framing::Buffer buffer(const_cast<char*>(t.start)/*won't ever be written to*/, t.size);
+#else
     qpid::framing::Buffer buffer(const_cast<char*>(t.bytes)/*won't ever be written to*/, t.size);
+#endif
     return (size_t) buffer.getLong();
 }
 

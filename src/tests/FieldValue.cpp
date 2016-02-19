@@ -19,6 +19,7 @@
 #include "qpid/framing/FieldValue.h"
 
 #include "unit_test.h"
+#include <boost/test/floating_point_comparison.hpp>
 
 namespace qpid {
 namespace tests {
@@ -29,9 +30,8 @@ using namespace qpid::framing;
 
 Str16Value s("abc");
 IntegerValue i(42);
-//DecimalValue d(1234,2);
-//FieldTableValue ft;
-//EmptyValue e;
+FloatValue f((float)42.42);
+DoubleValue df(123.123);
 
 QPID_AUTO_TEST_CASE(testStr16ValueEquals)
 {
@@ -43,52 +43,55 @@ QPID_AUTO_TEST_CASE(testStr16ValueEquals)
     BOOST_CHECK(s.convertsTo<int>() == false);
     BOOST_CHECK(s.get<std::string>() == "abc");
     BOOST_CHECK_THROW(s.get<int>(), InvalidConversionException);
-//    BOOST_CHECK(s != ft);
 
 }
 
 QPID_AUTO_TEST_CASE(testIntegerValueEquals)
 {
+    BOOST_CHECK(i.get<int>() == 42);
     BOOST_CHECK(IntegerValue(42) == i);
     BOOST_CHECK(IntegerValue(5) != i);
     BOOST_CHECK(i != s);
     BOOST_CHECK(i.convertsTo<std::string>() == false);
+    BOOST_CHECK(i.convertsTo<float>() == true);
     BOOST_CHECK(i.convertsTo<int>() == true);
     BOOST_CHECK_THROW(i.get<std::string>(), InvalidConversionException);
-    BOOST_CHECK(i.get<int>() == 42);
-//    BOOST_CHECK(i != ft);
+    BOOST_CHECK_EQUAL(i.get<float>(), 42.0);
 }
 
-#if 0
-QPID_AUTO_TEST_CASE(testDecimalValueEquals)
+QPID_AUTO_TEST_CASE(testFloatValueEquals)
 {
-    BOOST_CHECK(DecimalValue(1234, 2) == d);
-    BOOST_CHECK(DecimalValue(12345, 2) != d);
-    BOOST_CHECK(DecimalValue(1234, 3) != d);
-    BOOST_CHECK(d != s);
+    BOOST_CHECK(f.convertsTo<float>() == true);
+    BOOST_CHECK(FloatValue((float)42.42) == f);
+    BOOST_CHECK_CLOSE(double(f.get<float>()), 42.42, 0.001);
+    // Check twice, regression test for QPID-6470 where the value was corrupted during get.
+    BOOST_CHECK(FloatValue((float)42.42) == f);
+    BOOST_CHECK_CLOSE(f.get<double>(), 42.42, 0.001);
+
+    // Float to double conversion
+    BOOST_CHECK(f.convertsTo<double>() == true);
+    BOOST_CHECK_CLOSE(f.get<double>(), 42.42, 0.001);
+
+    // Double value
+    BOOST_CHECK(f.convertsTo<float>() == true);
+    BOOST_CHECK(f.convertsTo<double>() == true);
+    BOOST_CHECK_CLOSE(double(df.get<float>()), 123.123, 0.001);
+    BOOST_CHECK_CLOSE(df.get<double>(), 123.123, 0.001);
+
+    // Invalid conversions should fail.
+    BOOST_CHECK(!f.convertsTo<std::string>());
+    BOOST_CHECK(!f.convertsTo<int>());
+    BOOST_CHECK_THROW(f.get<std::string>(), InvalidConversionException);
+    BOOST_CHECK_THROW(f.get<int>(), InvalidConversionException);
+
+    // getFloatingPointValue: check twice, regression test for QPID-6470
+    BOOST_CHECK_CLOSE((double(f.getFloatingPointValue<float,sizeof(float)>())), 42.42, 0.001);
+    BOOST_CHECK_CLOSE((double(f.getFloatingPointValue<float,sizeof(float)>())), 42.42, 0.001);
+    BOOST_CHECK_CLOSE((df.getFloatingPointValue<double,sizeof(double)>()), 123.123, 0.001);
+    // getFloatingPointValue should *not* convert float/double, require exact type.
+    BOOST_CHECK_THROW((f.getFloatingPointValue<double,sizeof(double)>()), InvalidConversionException);
+    BOOST_CHECK_THROW((double(df.getFloatingPointValue<float,sizeof(float)>())), InvalidConversionException);
 }
-
-QPID_AUTO_TEST_CASE(testFieldTableValueEquals)
-{
-    ft.getValue().setString("foo", "FOO");
-    ft.getValue().setInt("magic", 7);
-
-    BOOST_CHECK_EQUAL(std::string("FOO"),
-                            ft.getValue().getString("foo"));
-    BOOST_CHECK_EQUAL(7, ft.getValue().getInt("magic"));
-
-    FieldTableValue f2;
-    BOOST_CHECK(ft != f2);
-    f2.getValue().setString("foo", "FOO");
-    BOOST_CHECK(ft != f2);
-    f2.getValue().setInt("magic", 7);
-    BOOST_CHECK_EQUAL(ft,f2);
-    BOOST_CHECK(ft == f2);
-    f2.getValue().setString("foo", "BAR");
-    BOOST_CHECK(ft != f2);
-    BOOST_CHECK(ft != i);
-}
-#endif
 
 QPID_AUTO_TEST_SUITE_END()
 

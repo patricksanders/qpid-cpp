@@ -43,6 +43,7 @@
 #include "qpid/linearstore/journal/utils/file_hdr.h"
 #include <sstream>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 namespace qpid {
@@ -99,10 +100,26 @@ void RecoveryManager::analyzeJournals(const std::vector<std::string>* preparedTr
     // Analyze file headers of existing journal files
     efpIdentity_t efpIdentity;
     analyzeJournalFileHeaders(efpIdentity);
-    *emptyFilePoolPtrPtr = emptyFilePoolManager->getEmptyFilePool(efpIdentity);
-    efpFileSize_kib_ = (*emptyFilePoolPtrPtr)->fileSize_kib();
 
-    if (!journalEmptyFlag_) {
+    if (journalEmptyFlag_) {
+        if (uninitFileList_.empty()) {
+            *emptyFilePoolPtrPtr = emptyFilePoolManager->getEmptyFilePool(0, 0); // Use default EFP
+        } else {
+            *emptyFilePoolPtrPtr = emptyFilePoolManager->getEmptyFilePool(efpIdentity);
+        }
+    } else {
+        *emptyFilePoolPtrPtr = emptyFilePoolManager->getEmptyFilePool(efpIdentity);
+        if (! *emptyFilePoolPtrPtr) {
+            // TODO: At a later time, this could be used to establish a new pool size provided the partition exists.
+            // If the partition does not exist, this is always an error. For now, throw an exception, as this should
+            // not occur in any practical application. Once multiple partitions and mixed EFPs are supported, this
+            // needs to be resolved. Note that EFP size is always a multiple of QLS_SBLK_SIZE_BYTES (currently 4096
+            // bytes, any other value cannot be used and should be rejected as an error.
+            std::ostringstream oss;
+            oss << "Invalid EFP identity: Partition=" << efpIdentity.pn_ << " Size=" << efpIdentity.ds_ << "k";
+            throw jexception(jerrno::JERR_RCVM_INVALIDEFPID, oss.str(), "RecoveryManager", "analyzeJournals");
+        }
+        efpFileSize_kib_ = (*emptyFilePoolPtrPtr)->fileSize_kib();
 
         // Read all records, establish remaining enqueued records
         if (inFileStream_.is_open()) {
@@ -131,7 +148,7 @@ void RecoveryManager::analyzeJournals(const std::vector<std::string>* preparedTr
                     // Unlock any affected enqueues in emap
                     for (tdl_itr_t i=tdl.begin(); i<tdl.end(); i++) {
                         if (i->enq_flag_) { // enq op - decrement enqueue count
-                            fileNumberMap_[i->pfid_]->journalFilePtr_->decrEnqueuedRecordCount();
+                            fileNumberMap_[i->fid_]->journalFilePtr_->decrEnqueuedRecordCount();
                         } else if (enqueueMapRef_.is_enqueued(i->drid_, true)) { // deq op - unlock enq record
                             if (enqueueMapRef_.unlock(i->drid_) < enq_map::EMAP_OK) { // fail
                                 // enq_map::unlock()'s only error is enq_map::EMAP_RID_NOT_FOUND
@@ -272,10 +289,17 @@ bool RecoveryManager::readNextRemainingRecord(void** const dataPtrPtr,
     return true;
 }
 
+void RecoveryManager::recoveryComplete() {
+    if(inFileStream_.is_open()) {
+        inFileStream_.close();
+    }
+}
+
 void RecoveryManager::setLinearFileControllerJournals(lfcAddJournalFileFn fnPtr,
                                                       LinearFileController* lfcPtr) {
     if (journalEmptyFlag_) {
         if (uninitFileList_.size() > 0) {
+            // TODO: Handle case if uninitFileList_.size() > 1, but this should not happen in normal operation. Here we assume only one item in the list.
             std::string uninitFile = uninitFileList_.back();
             uninitFileList_.pop_back();
             lfcPtr->restoreEmptyFile(uninitFile);
@@ -304,36 +328,7 @@ void RecoveryManager::setLinearFileControllerJournals(lfcAddJournalFileFn fnPtr,
     }
 }
 
-std::string RecoveryManager::toString(const std::string& jid) {
-    std::ostringstream oss;
-    oss << "Recovery journal analysis (jid=\"" << jid << "\"):" << std::endl;
-    oss << "  Number of journal files = " << fileNumberMap_.size() << std::endl;
-    oss << "  Journal File List:" << std::endl;
-    for (fileNumberMapConstItr_t k=fileNumberMap_.begin(); k!=fileNumberMap_.end(); ++k) {
-        std::string fqFileName = k->second->journalFilePtr_->getFqFileName();
-        oss << "    " << k->first << ": " << fqFileName.substr(fqFileName.rfind('/')+1) << std::endl;
-    }
-    oss << "  Enqueue Counts: [ ";
-    for (fileNumberMapConstItr_t l=fileNumberMap_.begin(); l!=fileNumberMap_.end(); ++l) {
-        if (l != fileNumberMap_.begin()) {
-            oss << ", ";
-        }
-        oss << l->second->journalFilePtr_->getEnqueuedRecordCount();
-    }
-    oss << " ]" << std::endl;
-    oss << "  Journal empty = " << (journalEmptyFlag_ ? "TRUE" : "FALSE") << std::endl;
-    oss << "  First record offset in first file = 0x" << std::hex << firstRecordOffset_ <<
-            std::dec << " (" << (firstRecordOffset_/QLS_DBLK_SIZE_BYTES) << " dblks)" << std::endl;
-    oss << "  End offset = 0x" << std::hex << endOffset_ << std::dec << " ("  <<
-            (endOffset_/QLS_DBLK_SIZE_BYTES) << " dblks)" << std::endl;
-    oss << "  Highest rid = 0x" << std::hex << highestRecordId_ << std::dec << std::endl;
-    oss << "  Highest file number = 0x" << std::hex << highestFileNumber_ << std::dec << std::endl;
-    oss << "  Last file full = " << (lastFileFullFlag_ ? "TRUE" : "FALSE") << std::endl;
-    oss << "  Enqueued records (txn & non-txn):" << std::endl;
-    return oss.str();
-}
-
-std::string RecoveryManager::toLog(const std::string& jid, const int indent) {
+std::string RecoveryManager::toString(const std::string& jid, const uint16_t indent) const {
     std::string indentStr(indent, ' ');
     std::ostringstream oss;
     oss << std::endl << indentStr  << "Journal recovery analysis (jid=\"" << jid << "\"):" << std::endl;
@@ -342,18 +337,17 @@ std::string RecoveryManager::toLog(const std::string& jid, const int indent) {
     } else {
         oss << indentStr << std::setw(7) << "file_id"
                          << std::setw(43) << "file_name"
-                         << std::setw(16) << "fro"
                          << std::setw(12) << "record_cnt"
-                         << std::setw(5) << "ptn"
-                         << std::setw(10) << "efp"
+                         << std::setw(16) << "fro"
+                         << std::setw(12) << "efp_id"
                          << std::endl;
         oss << indentStr << std::setw(7) << "-------"
                          << std::setw(43) << "-----------------------------------------"
+                         << std::setw(12) << "----------"
                          << std::setw(16) << "--------------"
                          << std::setw(12) << "----------"
-                         << std::setw(5) << "---"
-                         << std::setw(10) << "--------"
                          << std::endl;
+        uint32_t totalRecordCount(0UL);
         for (fileNumberMapConstItr_t k=fileNumberMap_.begin(); k!=fileNumberMap_.end(); ++k) {
             std::string fqFileName = k->second->journalFilePtr_->getFqFileName();
             std::ostringstream fid;
@@ -362,19 +356,20 @@ std::string RecoveryManager::toLog(const std::string& jid, const int indent) {
             fro << std::hex << "0x" << k->second->journalFilePtr_->getFirstRecordOffset();
             oss << indentStr << std::setw(7) << fid.str()
                              << std::setw(43) << fqFileName.substr(fqFileName.rfind('/')+1)
-                             << std::setw(16) << fro.str()
                              << std::setw(12) << k->second->journalFilePtr_->getEnqueuedRecordCount()
-                             << std::setw(5) << k->second->journalFilePtr_->getEfpIdentity().pn_
-                             << std::setw(9) << k->second->journalFilePtr_->getEfpIdentity().ds_ << "k"
+                             << std::setw(16) << fro.str()
+                             << std::setw(12) << k->second->journalFilePtr_->getEfpIdentity()
                              << std::endl;
+            totalRecordCount += k->second->journalFilePtr_->getEnqueuedRecordCount();
         }
+        oss << indentStr << std::setw(62) << "----------" << std::endl;
+        oss << indentStr << std::setw(62) << totalRecordCount << std::endl;
         oss << indentStr << "First record offset in first file = 0x" << std::hex << firstRecordOffset_ <<
                 std::dec << " (" << (firstRecordOffset_/QLS_DBLK_SIZE_BYTES) << " dblks)" << std::endl;
         oss << indentStr << "End offset in last file = 0x" << std::hex << endOffset_ << std::dec << " ("  <<
                 (endOffset_/QLS_DBLK_SIZE_BYTES) << " dblks)" << std::endl;
         oss << indentStr << "Highest rid found = 0x" << std::hex << highestRecordId_ << std::dec << std::endl;
         oss << indentStr << "Last file full = " << (lastFileFullFlag_ ? "TRUE" : "FALSE") << std::endl;
-        //oss << indentStr << "Enqueued records (txn & non-txn):"; // TODO: complete report
     }
     return oss.str();
 }
@@ -387,12 +382,29 @@ void RecoveryManager::analyzeJournalFileHeaders(efpIdentity_t& efpIdentity) {
     stringList_t directoryList;
     jdir::read_dir(journalDirectory_, directoryList, false, true, false, true);
     for (stringListConstItr_t i = directoryList.begin(); i != directoryList.end(); ++i) {
-        readJournalFileHeader(*i, fileHeader, headerQueueName);
-        if (headerQueueName.empty()) {
+        bool hdrOk = readJournalFileHeader(*i, fileHeader, headerQueueName);
+        bool hdrEmpty = ::is_file_hdr_reset(&fileHeader);
+        if (!hdrOk) {
             std::ostringstream oss;
-            oss << "Journal file " << (*i) << " is uninitialized";
+            oss << "Journal file " << (*i) << " is corrupted or invalid";
             journalLogRef_.log(JournalLog::LOG_WARN, queueName_, oss.str());
+        } else if (hdrEmpty) {
+            // Read symlink, find efp directory name which is efp size in KiB
+            // TODO: place this bit into a common function as it is also used in EmptyFilePool.cpp::deleteSymlink()
+            char buff[1024];
+            ssize_t len = ::readlink((*i).c_str(), buff, 1024);
+            if (len < 0) {
+                std::ostringstream oss;
+                oss << "symlink=\"" << (*i) << "\"" << FORMAT_SYSERR(errno);
+                throw jexception(jerrno::JERR__SYMLINK, oss.str(), "RecoveryManager", "analyzeJournalFileHeaders");
+            }
+            // Find second and third '/' from back of string, which contains the EFP directory name
+            *(::strrchr(buff, '/')) = '\0';
+            *(::strrchr(buff, '/')) = '\0';
+            int efpDataSize_kib = atoi(::strrchr(buff, '/') + 1);
             uninitFileList_.push_back(*i);
+            efpIdentity.pn_ = fileHeader._efp_partition;
+            efpIdentity.ds_ = efpDataSize_kib;
         } else if (headerQueueName.compare(queueName_) != 0) {
             std::ostringstream oss;
             oss << "Journal file " << (*i) << " belongs to queue \"" << headerQueueName << "\": ignoring";
@@ -409,15 +421,15 @@ void RecoveryManager::analyzeJournalFileHeaders(efpIdentity_t& efpIdentity) {
             if (fileHeader._file_number > highestFileNumber_) {
                 highestFileNumber_ = fileHeader._file_number;
             }
+            // TODO: Logic weak here for detecting error conditions in journal, specifically when no
+            // valid files exist, or files from mixed EFPs. Currently last read file header determines
+            // efpIdentity.
+            efpIdentity.pn_ = fileHeader._efp_partition;
+            efpIdentity.ds_ = fileHeader._data_size_kib;
         }
     }
 
-    // TODO: Logic weak here for detecting error conditions in journal, specifically when no
-    // valid files exist, or files from mixed EFPs. Currently last read file header determines
-    // efpIdentity.
-    efpIdentity.pn_ = fileHeader._efp_partition;
-    efpIdentity.ds_ = fileHeader._data_size_kib;
-
+//std::cerr << "*** RecoveryManager::analyzeJournalFileHeaders() fileNumberMap_.size()=" << fileNumberMap_.size() << std::endl; // DEBUG
     if (fileNumberMap_.empty()) {
         journalEmptyFlag_ = true;
     } else {
@@ -593,7 +605,18 @@ bool RecoveryManager::getNextRecordHeader()
 
     bool hdr_ok = false;
     uint64_t file_id = currentJournalFileItr_->second->journalFilePtr_->getFileSeqNum();
-    std::streampos file_pos = inFileStream_.tellg();
+    std::streampos file_pos = 0;
+    if (inFileStream_.is_open()) {
+        inFileStream_.clear();
+        file_pos = inFileStream_.tellg();
+    }
+    if (file_pos == std::streampos(-1)) {
+        std::ostringstream oss;
+        oss << "tellg() failure: fail=" << (inFileStream_.fail()?"T":"F") << " bad=" << (inFileStream_.bad()?"T":"F");
+        oss << " eof=" << (inFileStream_.eof()?"T":"F") << " good=" << (inFileStream_.good()?"T":"F");
+        oss << " rdstate=0x" << std::hex << inFileStream_.rdstate() << std::dec;
+        throw jexception(jerrno::JERR_RCVM_STREAMBAD, oss.str(), "RecoveryManager", "getNextRecordHeader");
+    }
     while (!hdr_ok) {
         if (needNextFile()) {
             if (!getNextFile(true)) {
@@ -606,6 +629,8 @@ bool RecoveryManager::getNextRecordHeader()
         if (file_pos == std::streampos(-1)) {
             std::ostringstream oss;
             oss << "tellg() failure: fail=" << (inFileStream_.fail()?"T":"F") << " bad=" << (inFileStream_.bad()?"T":"F");
+            oss << " eof=" << (inFileStream_.eof()?"T":"F") << " good=" << (inFileStream_.good()?"T":"F");
+            oss << " rdstate=0x" << std::hex << inFileStream_.rdstate() << std::dec;
             throw jexception(jerrno::JERR_RCVM_STREAMBAD, oss.str(), "RecoveryManager", "getNextRecordHeader");
         }
         inFileStream_.read((char*)&h, sizeof(rec_hdr_t));
@@ -627,7 +652,7 @@ bool RecoveryManager::getNextRecordHeader()
             {
 //std::cout << " 0x" << std::hex << file_pos << ".e.0x" << h._rid << std::dec << std::flush; // DEBUG
                 if (::rec_hdr_check(&h, QLS_ENQ_MAGIC, QLS_JRNL_VERSION, currentSerial_) != 0) {
-                    lastRecord(file_id, file_pos);
+                    checkJournalAlignment(file_id, file_pos);
                     return false;
                 }
                 enq_rec er;
@@ -663,7 +688,7 @@ bool RecoveryManager::getNextRecordHeader()
             {
 //std::cout << " 0x" << std::hex << file_pos << ".d.0x" << h._rid << std::dec << std::flush; // DEBUG
                 if (::rec_hdr_check(&h, QLS_DEQ_MAGIC, QLS_JRNL_VERSION, currentSerial_) != 0) {
-                    lastRecord(file_id, file_pos);
+                    checkJournalAlignment(file_id, file_pos);
                     return false;
                 }
                 deq_rec dr;
@@ -697,7 +722,7 @@ bool RecoveryManager::getNextRecordHeader()
             {
 //std::cout << " 0x" << std::hex << file_pos << ".a.0x" << h._rid << std::dec << std::flush; // DEBUG
                 if (::rec_hdr_check(&h, QLS_TXA_MAGIC, QLS_JRNL_VERSION, currentSerial_) != 0) {
-                    lastRecord(file_id, file_pos);
+                    checkJournalAlignment(file_id, file_pos);
                     return false;
                 }
                 txn_rec ar;
@@ -713,7 +738,7 @@ bool RecoveryManager::getNextRecordHeader()
                 txn_data_list_t tdl = transactionMapRef_.get_remove_tdata_list(xid); // tdl will be empty if xid not found
                 for (tdl_itr_t itr = tdl.begin(); itr != tdl.end(); itr++) {
                     if (itr->enq_flag_) {
-                        fileNumberMap_[itr->pfid_]->journalFilePtr_->decrEnqueuedRecordCount();
+                        fileNumberMap_[itr->fid_]->journalFilePtr_->decrEnqueuedRecordCount();
                     } else {
                         enqueueMapRef_.unlock(itr->drid_); // ignore not found error
                     }
@@ -724,7 +749,7 @@ bool RecoveryManager::getNextRecordHeader()
             {
 //std::cout << " 0x" << std::hex << file_pos << ".c.0x" << h._rid << std::dec << std::flush; // DEBUG
                 if (::rec_hdr_check(&h, QLS_TXC_MAGIC, QLS_JRNL_VERSION, currentSerial_) != 0) {
-                    lastRecord(file_id, file_pos);
+                    checkJournalAlignment(file_id, file_pos);
                     return false;
                 }
                 txn_rec cr;
@@ -740,11 +765,11 @@ bool RecoveryManager::getNextRecordHeader()
                 txn_data_list_t tdl = transactionMapRef_.get_remove_tdata_list(xid); // tdl will be empty if xid not found
                 for (tdl_itr_t itr = tdl.begin(); itr != tdl.end(); itr++) {
                     if (itr->enq_flag_) { // txn enqueue
-//std::cout << "[rid=0x" << std::hex << itr->rid_ << std::dec << " fid=" << itr->pfid_ << " fpos=0x" << std::hex << itr->foffs_ << "]" << std::dec << std::flush; // DEBUG
-                        if (enqueueMapRef_.insert_pfid(itr->rid_, itr->pfid_, itr->foffs_) < enq_map::EMAP_OK) { // fail
+//std::cout << "[rid=0x" << std::hex << itr->rid_ << std::dec << " fid=" << itr->fid_ << " fpos=0x" << std::hex << itr->foffs_ << "]" << std::dec << std::flush; // DEBUG
+                        if (enqueueMapRef_.insert_pfid(itr->rid_, itr->fid_, itr->foffs_) < enq_map::EMAP_OK) { // fail
                             // The only error code emap::insert_pfid() returns is enq_map::EMAP_DUP_RID.
                             std::ostringstream oss;
-                            oss << std::hex << "rid=0x" << itr->rid_ << " _pfid=0x" << itr->pfid_;
+                            oss << std::hex << "rid=0x" << itr->rid_ << " _pfid=0x" << itr->fid_;
                             throw jexception(jerrno::JERR_MAP_DUPLICATE, oss.str(), "RecoveryManager", "getNextRecordHeader");
                         }
                     } else { // txn dequeue
@@ -829,7 +854,7 @@ void RecoveryManager::prepareRecordList() {
         qpid::linearstore::journal::txn_data_list_t tdsl = transactionMapRef_.get_tdata_list(*j);
         for (qpid::linearstore::journal::tdl_itr_t k=tdsl.begin(); k!=tdsl.end(); ++k) {
             if (k->enq_flag_) {
-                recordIdList_.push_back(RecoveredRecordData_t(k->rid_, k->pfid_, k->foffs_, true));
+                recordIdList_.push_back(RecoveredRecordData_t(k->rid_, k->fid_, k->foffs_, true));
             }
         }
     }
@@ -869,7 +894,7 @@ bool RecoveryManager::readFileHeader() {
     file_hdr_t fhdr;
     inFileStream_.read((char*)&fhdr, sizeof(fhdr));
     checkFileStreamOk(true);
-    if (::file_hdr_check(&fhdr, QLS_FILE_MAGIC, QLS_JRNL_VERSION, efpFileSize_kib_) != 0) {
+    if (::file_hdr_check(&fhdr, QLS_FILE_MAGIC, QLS_JRNL_VERSION, efpFileSize_kib_, QLS_MAX_QUEUE_NAME_LEN) != 0) {
         firstRecordOffset_ = fhdr._fro;
         currentSerial_ = fhdr._rhdr._serial;
     } else {
@@ -883,7 +908,7 @@ bool RecoveryManager::readFileHeader() {
 }
 
 // static private
-void RecoveryManager::readJournalFileHeader(const std::string& journalFileName,
+bool RecoveryManager::readJournalFileHeader(const std::string& journalFileName,
                                             ::file_hdr_t& fileHeaderRef,
                                             std::string& queueName) {
     const std::size_t headerBlockSize = QLS_JRNL_FHDR_RES_SIZE_SBLKS * QLS_SBLK_SIZE_KIB * 1024;
@@ -904,14 +929,17 @@ void RecoveryManager::readJournalFileHeader(const std::string& journalFileName,
     }
     ifs.close();
     ::memcpy(&fileHeaderRef, buffer, sizeof(::file_hdr_t));
+    if (::file_hdr_check(&fileHeaderRef, QLS_FILE_MAGIC, QLS_JRNL_VERSION, 0, QLS_MAX_QUEUE_NAME_LEN)) {
+        return false;
+    }
     queueName.assign(buffer + sizeof(::file_hdr_t), fileHeaderRef._queue_name_len);
-
+    return true;
 }
 
 void RecoveryManager::removeEmptyFiles(EmptyFilePool* emptyFilePoolPtr) {
     while (fileNumberMap_.begin()->second->journalFilePtr_->getEnqueuedRecordCount() == 0 && fileNumberMap_.size() > 1) {
         RecoveredFileData_t* rfdp = fileNumberMap_.begin()->second;
-        emptyFilePoolPtr->returnEmptyFile(rfdp->journalFilePtr_->getFqFileName());
+        emptyFilePoolPtr->returnEmptyFileSymlink(rfdp->journalFilePtr_->getFqFileName());
         delete rfdp->journalFilePtr_;
         delete rfdp;
         fileNumberMap_.erase(fileNumberMap_.begin()->first);

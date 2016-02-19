@@ -1,3 +1,9 @@
+qpid-cpp (0.34-1) unstable; urgency=low
+
+  * Update to upstream 0.34 release.
+
+ -- Patrick Sanders <mail@patricksanders.net>  Thu, 18 Feb 2016 20:25:00 -0600
+
 qpid-cpp (0.26-3) unstable; urgency=low
 
   * Patch /etc/sasl2/qpidd.conf to correct path of qpidd.sasldb

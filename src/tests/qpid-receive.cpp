@@ -60,6 +60,7 @@ struct Options : public qpid::Options
     uint tx;
     uint rollbackFrequency;
     bool printContent;
+    bool printContentObjectType;
     bool printHeaders;
     bool failoverUpdates;
     qpid::log::Options log;
@@ -86,6 +87,7 @@ struct Options : public qpid::Options
           tx(0),
           rollbackFrequency(0),
           printContent(true),
+          printContentObjectType(false),
           printHeaders(false),
           failoverUpdates(false),
           log(argv0),
@@ -110,6 +112,7 @@ struct Options : public qpid::Options
             ("tx", qpid::optValue(tx, "N"), "batch size for transactions (0 implies transaction are not used)")
             ("rollback-frequency", qpid::optValue(rollbackFrequency, "N"), "rollback frequency (0 implies no transaction will be rolledback)")
             ("print-content", qpid::optValue(printContent, "yes|no"), "print out message content")
+            ("print-object-type", qpid::optValue(printContentObjectType, "yes|no"), "print a description of the content's object type if relevant")
             ("print-headers", qpid::optValue(printHeaders, "yes|no"), "print out message headers")
             ("failover-updates", qpid::optValue(failoverUpdates), "Listen for membership updates distributed via amq.failover")
             ("report-total", qpid::optValue(reportTotal), "Report total throughput and latency statistics")
@@ -194,7 +197,7 @@ int main(int argc, char ** argv)
             std::auto_ptr<FailoverUpdates> updates(opts.failoverUpdates ? new FailoverUpdates(connection) : 0);
             Session session = opts.tx ? connection.createTransactionalSession() : connection.createSession();
             Receiver receiver = session.createReceiver(opts.address);
-            receiver.setCapacity(opts.capacity);
+            receiver.setCapacity(std::min(opts.capacity, opts.messages));
             Message msg;
             uint count = 0;
             uint txCount = 0;
@@ -204,9 +207,9 @@ int main(int argc, char ** argv)
             Reporter<ThroughputAndLatency> reporter(std::cout, opts.reportEvery, opts.reportHeader);
             if (!opts.readyAddress.empty()) {
                 session.createSender(opts.readyAddress).send(msg);
-		if (opts.tx)
-		    session.commit();
-	    }
+                if (opts.tx)
+                    session.commit();
+            }
             // For receive rate calculation
             qpid::sys::AbsTime start = qpid::sys::now();
             int64_t interval = 0;
@@ -232,11 +235,18 @@ int main(int argc, char ** argv)
                             if (msg.getDurable()) std::cout << "Durable: true" << std::endl;
                             if (msg.getRedelivered()) std::cout << "Redelivered: true" << std::endl;
                             std::cout << "Properties: " << msg.getProperties() << std::endl;
+                            if (msg.getContentType().size()) std::cout << "ContentType: " << msg.getContentType() << std::endl;
                             std::cout << std::endl;
                         }
                         if (opts.printContent) {
-                            if (!msg.getContentObject().isVoid()) std::cout << msg.getContentObject() << std::endl;
-                            else std::cout << msg.getContent() << std::endl;
+                            if (!msg.getContentObject().isVoid()) {
+                                if (opts.printContentObjectType) {
+                                    std::cout << "[Object: " << getTypeName(msg.getContentObject().getType()) << "]" << std::endl;
+                                }
+                                std::cout << msg.getContentObject() << std::endl;
+                            } else {
+                                std::cout << msg.getContent() << std::endl;
+                            }
                         }
                         if (opts.messages && count >= opts.messages) done = true;
                     }
@@ -280,6 +290,7 @@ int main(int argc, char ** argv)
             connection.close();
             return 0;
         }
+        return 1;
     } catch(const std::exception& error) {
         std::cerr << "qpid-receive: " << error.what() << std::endl;
         connection.close();

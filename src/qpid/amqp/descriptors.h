@@ -26,6 +26,9 @@
 namespace qpid {
 namespace amqp {
 
+// NOTE: If you add descriptor symbols and codes here, you must also update the DescriptorMap
+// constructor in Descriptor.cpp.
+
 namespace message {
 const std::string HEADER_SYMBOL("amqp:header:list");
 const std::string PROPERTIES_SYMBOL("amqp:properties:list");
@@ -36,6 +39,7 @@ const std::string AMQP_SEQUENCE_SYMBOL("amqp:amqp-sequence:list");
 const std::string AMQP_VALUE_SYMBOL("amqp:amqp-value:*");
 const std::string DATA_SYMBOL("amqp:data:binary");
 const std::string FOOTER_SYMBOL("amqp:footer:map");
+const std::string ACCEPTED_SYMBOL("amqp:accepted:list");
 
 const uint64_t HEADER_CODE(0x70);
 const uint64_t DELIVERY_ANNOTATIONS_CODE(0x71);
@@ -46,6 +50,7 @@ const uint64_t DATA_CODE(0x75);
 const uint64_t AMQP_SEQUENCE_CODE(0x76);
 const uint64_t AMQP_VALUE_CODE(0x77);
 const uint64_t FOOTER_CODE(0x78);
+const uint64_t ACCEPTED_CODE(0x24);
 
 const Descriptor HEADER(HEADER_CODE);
 const Descriptor DELIVERY_ANNOTATIONS(DELIVERY_ANNOTATIONS_CODE);
@@ -102,6 +107,18 @@ const uint64_t DELETE_ON_NO_MESSAGES_CODE(0x2D);
 const uint64_t DELETE_ON_NO_LINKS_OR_MESSAGES_CODE(0x2E);
 }
 
+namespace transaction {
+const std::string DECLARE_SYMBOL("amqp:declare:list");
+const std::string DISCHARGE_SYMBOL("amqp:discharge:list");
+const std::string DECLARED_SYMBOL("amqp:declared:list");
+const std::string TRANSACTIONAL_STATE_SYMBOL("amqp:transactional-state:list");
+
+const uint64_t DECLARE_CODE(0x31);
+const uint64_t DISCHARGE_CODE(0x32);
+const uint64_t DECLARED_CODE(0x33);
+const uint64_t TRANSACTIONAL_STATE_CODE(0x34);
+}
+
 namespace error_conditions {
 //note these are not actually descriptors
 const std::string INTERNAL_ERROR("amqp:internal-error");
@@ -113,6 +130,10 @@ const std::string NOT_IMPLEMENTED("amqp:not-implemented");
 const std::string RESOURCE_LIMIT_EXCEEDED("amqp:resource-limit-exceeded");
 const std::string RESOURCE_DELETED("amqp:resource-deleted");
 const std::string PRECONDITION_FAILED("amqp:precondition-failed");
+namespace transaction {
+const std::string UNKNOWN_ID("amqp:transaction:unknown-id");
+const std::string ROLLBACK("amqp:transaction:rollback");
+}
 }
 }} // namespace qpid::amqp
 

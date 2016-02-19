@@ -33,7 +33,7 @@ namespace qpid {
 namespace broker {
 namespace amqp {
 Incoming::Incoming(pn_link_t* l, Broker& broker, Session& parent, const std::string& source, const std::string& target, const std::string& name)
-    : ManagedIncomingLink(broker, parent, source, target, name), credit(100), window(0), link(l), session(parent) {}
+    : ManagedIncomingLink(broker, parent, source, target, name), credit(500), window(0), link(l), session(parent) {}
 
 
 Incoming::~Incoming() {}
@@ -57,7 +57,7 @@ uint32_t Incoming::getCredit()
     return credit;//TODO: proper flow control
 }
 
-void Incoming::detached()
+void Incoming::detached(bool /*closed*/)
 {
 }
 
@@ -100,6 +100,7 @@ namespace {
             boost::intrusive_ptr<qpid::broker::AsyncCompletion::Callback> copy(new Transfer(delivery, session));
             return copy;
         }
+
       private:
         pn_delivery_t* delivery;
         boost::shared_ptr<Session> session;
@@ -107,7 +108,7 @@ namespace {
 }
 
 DecodingIncoming::DecodingIncoming(pn_link_t* link, Broker& broker, Session& parent, const std::string& source, const std::string& target, const std::string& name)
-    : Incoming(link, broker, parent, source, target, name), session(parent.shared_from_this()), expiryPolicy(broker.getExpiryPolicy()) {}
+    : Incoming(link, broker, parent, source, target, name), sessionPtr(parent.shared_from_this()) {}
 DecodingIncoming::~DecodingIncoming() {}
 
 void DecodingIncoming::readable(pn_delivery_t* delivery)
@@ -126,6 +127,7 @@ void DecodingIncoming::readable(pn_delivery_t* delivery)
         QPID_LOG(debug, "Message incomplete: received " << pending << " bytes, now have " << received->getSize());
         partial = received;
     } else {
+	incomingMessageReceived();
         if (offset) {
             QPID_LOG(debug, "Message complete: received " << pending << " bytes, " << received->getSize() << " in total");
         } else {
@@ -134,16 +136,20 @@ void DecodingIncoming::readable(pn_delivery_t* delivery)
 
         received->scan();
         pn_link_advance(link);
-
-        qpid::broker::Message message(received, received);
-        message.setPublisher(session->getParent());
-        userid.verify(message.getUserId());
-        message.computeExpiration(expiryPolicy);
-        handle(message);
+        received->setPublisher(&session.getParent());
+        received->computeExpiration();
         --window;
-        received->begin();
-        Transfer t(delivery, session);
-        received->end(t);
+        deliver(received, delivery);
     }
+}
+
+void DecodingIncoming::deliver(boost::intrusive_ptr<qpid::broker::amqp::Message> received, pn_delivery_t* delivery)
+{
+    qpid::broker::Message message(received, received);
+    userid.verify(message.getUserId());
+    received->begin();
+    handle(message, session.getTransaction(delivery));
+    Transfer t(delivery, sessionPtr);
+    received->end(t);
 }
 }}} // namespace qpid::broker::amqp

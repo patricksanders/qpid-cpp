@@ -47,13 +47,13 @@ SaslFactory& SaslFactory::getInstance()
     return *instance;
 }
 
-std::auto_ptr<Sasl> SaslFactory::create( const std::string &, const std::string &, const std::string &, const std::string &, int, int, bool )
+std::auto_ptr<Sasl> SaslFactory::create(const std::string& username, const std::string& password, const std::string&, const std::string&, int, int, bool)
 {
-    std::auto_ptr<Sasl> client(new NullSaslClient);
+    std::auto_ptr<Sasl> client(new NullSaslClient(username, password));
     return client;
 }
 
-std::auto_ptr<SaslServer> SaslFactory::createServer(const std::string& realm, bool /*encryptionRequired*/, const qpid::sys::SecuritySettings&)
+std::auto_ptr<SaslServer> SaslFactory::createServer(const std::string& realm, const std::string& /*service*/, bool /*encryptionRequired*/, const qpid::sys::SecuritySettings&)
 {
     std::auto_ptr<SaslServer> server(new NullSaslServer(realm));
     return server;
@@ -152,7 +152,7 @@ std::auto_ptr<SaslFactory> SaslFactory::instance;
 class CyrusSaslServer : public SaslServer
 {
   public:
-    CyrusSaslServer(const std::string& realm, bool encryptionRequired, const qpid::sys::SecuritySettings& external);
+    CyrusSaslServer(const std::string& realm, const std::string& service, bool encryptionRequired, const qpid::sys::SecuritySettings& external);
     ~CyrusSaslServer();
     Status start(const std::string& mechanism, const std::string* response, std::string& challenge);
     Status step(const std::string* response, std::string& challenge);
@@ -161,6 +161,7 @@ class CyrusSaslServer : public SaslServer
     std::auto_ptr<qpid::sys::SecurityLayer> getSecurityLayer(size_t);
   private:
     std::string realm;
+    std::string service;
     std::string userid;
     sasl_conn_t *sasl_conn;
 };
@@ -194,9 +195,9 @@ std::auto_ptr<Sasl> SaslFactory::create(const std::string & username, const std:
     return sasl;
 }
 
-std::auto_ptr<SaslServer> SaslFactory::createServer(const std::string& realm, bool encryptionRequired, const qpid::sys::SecuritySettings& external)
+std::auto_ptr<SaslServer> SaslFactory::createServer(const std::string& realm, const std::string& service, bool encryptionRequired, const qpid::sys::SecuritySettings& external)
 {
-    std::auto_ptr<SaslServer> server(new CyrusSaslServer(realm, encryptionRequired, external));
+    std::auto_ptr<SaslServer> server(new CyrusSaslServer(realm, service, encryptionRequired, external));
     return server;
 }
 
@@ -279,11 +280,11 @@ bool CyrusSasl::start(const std::string& mechanisms, std::string& response, cons
     secprops.maxbufsize = 65535;
 
     QPID_LOG(debug, "min_ssf: " << secprops.min_ssf << ", max_ssf: " << secprops.max_ssf);
-    
+
     secprops.property_names = 0;
     secprops.property_values = 0;
     secprops.security_flags = 0;//TODO: provide means for application to configure these
-    
+
     result = sasl_setprop(conn, SASL_SEC_PROPS, &secprops);
     if (result != SASL_OK) {
         throw framing::InternalErrorException(QPID_MSG("SASL error: " << sasl_errdetail(conn)));
@@ -307,7 +308,13 @@ bool CyrusSasl::start(const std::string& mechanisms, std::string& response, cons
         }        
     } while (result == SASL_INTERACT);
 
-    if (result != SASL_CONTINUE && result != SASL_OK) {
+    if (result == SASL_NOMECH) {
+        if (mechanisms.size()) {
+            throw qpid::Exception(std::string("Can't authenticate using ") + mechanisms);
+        } else {
+            throw qpid::Exception("No mutually acceptable authentication mechanism");
+        }
+    } else if (result != SASL_CONTINUE && result != SASL_OK) {
         throw InternalErrorException(QPID_MSG("Sasl error: " << sasl_errdetail(conn)));
     }
 
@@ -413,9 +420,9 @@ std::auto_ptr<SecurityLayer> CyrusSasl::getSecurityLayer(uint16_t maxFrameSize)
     return securityLayer;
 }
 
-CyrusSaslServer::CyrusSaslServer(const std::string& r, bool encryptionRequired, const qpid::sys::SecuritySettings& external) : realm(r), sasl_conn(0)
+CyrusSaslServer::CyrusSaslServer(const std::string& r, const std::string& s, bool encryptionRequired, const qpid::sys::SecuritySettings& external) : realm(r), service(s), sasl_conn(0)
 {
-    int code = sasl_server_new(BROKER_SASL_NAME, /* Service name */
+    int code = sasl_server_new(service.c_str(), /* Service name */
                                NULL, /* Server FQDN, gethostname() */
                                realm.c_str(), /* Authentication realm */
                                NULL, /* Local IP, needed for some mechanism */

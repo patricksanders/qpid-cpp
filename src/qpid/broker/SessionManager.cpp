@@ -47,11 +47,11 @@ SessionManager::~SessionManager() {
     detached.clear();           // Must clear before destructor as session dtor will call forget()
 }
 
-std::auto_ptr<SessionState>  SessionManager::attach(SessionHandler& h, const SessionId& id, bool/*force*/) {
+std::auto_ptr<SessionState>  SessionManager::attach(SessionHandler& h, const SessionId& id, bool force) {
     Mutex::ScopedLock l(lock);
     eraseExpired();             // Clean up expired table
     std::pair<Attached::iterator, bool> insert = attached.insert(id);
-    if (!insert.second)
+    if (!insert.second && !force)
         throw SessionBusyException(QPID_MSG("Session already attached: " << id));
     Detached::iterator i = std::find(detached.begin(), detached.end(), id);
     std::auto_ptr<SessionState> state;
@@ -62,7 +62,6 @@ std::auto_ptr<SessionState>  SessionManager::attach(SessionHandler& h, const Ses
         state->attach(h);
     }
     return state;
-    // FIXME aconway 2008-04-29: implement force 
 }
 
 void  SessionManager::detach(std::auto_ptr<SessionState> session) {
@@ -70,9 +69,9 @@ void  SessionManager::detach(std::auto_ptr<SessionState> session) {
     attached.erase(session->getId());
     session->detach();
     if (session->getTimeout() > 0) {
-    session->expiry = AbsTime(now(),session->getTimeout()*TIME_SEC);
+    session->expiry = AbsTime(now(), session->getTimeout()*TIME_SEC);
     if (session->mgmtObject != 0)
-        session->mgmtObject->set_expireTime ((uint64_t) Duration (EPOCH, session->expiry));
+        session->mgmtObject->set_expireTime (Duration::FromEpoch()+session->getTimeout()*TIME_SEC);
         detached.push_back(session.release()); // In expiry order
     eraseExpired();
 }

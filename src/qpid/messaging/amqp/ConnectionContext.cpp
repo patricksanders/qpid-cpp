@@ -20,12 +20,17 @@
  */
 #include "ConnectionContext.h"
 #include "DriverImpl.h"
+#include "PnData.h"
 #include "ReceiverContext.h"
 #include "Sasl.h"
 #include "SenderContext.h"
 #include "SessionContext.h"
+#include "Transaction.h"
 #include "Transport.h"
+#include "util.h"
 #include "qpid/amqp/descriptors.h"
+#include "qpid/amqp/Encoder.h"
+#include "qpid/amqp/Descriptor.h"
 #include "qpid/messaging/exceptions.h"
 #include "qpid/messaging/AddressImpl.h"
 #include "qpid/messaging/Duration.h"
@@ -38,9 +43,11 @@
 #include "qpid/sys/SecurityLayer.h"
 #include "qpid/sys/SystemInfo.h"
 #include "qpid/sys/Time.h"
+#include "qpid/sys/Timer.h"
 #include "qpid/sys/urlAdd.h"
 #include "config.h"
 #include <boost/lexical_cast.hpp>
+#include <boost/bind.hpp>
 #include <vector>
 extern "C" {
 #include <proton/engine.h>
@@ -49,10 +56,10 @@ extern "C" {
 namespace qpid {
 namespace messaging {
 namespace amqp {
+using types::Variant;
+
 namespace {
 
-//remove conditional when 0.5 is no longer supported
-#ifdef HAVE_PROTON_TRACER
 void do_trace(pn_transport_t* transport, const char* message)
 {
     ConnectionContext* c = reinterpret_cast<ConnectionContext*>(pn_transport_get_context(transport));
@@ -64,11 +71,50 @@ void set_tracer(pn_transport_t* transport, void* context)
     pn_transport_set_context(transport, context);
     pn_transport_set_tracer(transport, &do_trace);
 }
-#else
-void set_tracer(pn_transport_t*, void*)
+
+#ifdef USE_PROTON_TRANSPORT_CONDITION
+std::string get_error(pn_connection_t* connection, pn_transport_t* transport)
 {
+    std::stringstream text;
+    pn_error_t* cerror = pn_connection_error(connection);
+    if (cerror) text << "connection error " << pn_error_text(cerror) << " [" << cerror << "]";
+    pn_condition_t* tcondition = pn_transport_condition(transport);
+    if (pn_condition_is_set(tcondition)) text << get_error_string(tcondition, "transport error", ": ");
+    return text.str();
+}
+#else
+std::string get_error(pn_connection_t* connection, pn_transport_t* transport)
+{
+    std::stringstream text;
+    pn_error_t* cerror = pn_connection_error(connection);
+    if (cerror) text << "connection error " << pn_error_text(cerror) << " [" << cerror << "]";
+    pn_error_t* terror = pn_transport_error(transport);
+    if (terror) text << "transport error " << pn_error_text(terror) << " [" << terror << "]";
+    return text.str();
 }
 #endif
+
+class ConnectionTickerTask : public qpid::sys::TimerTask
+{
+    qpid::sys::Timer& timer;
+    ConnectionContext& connection;
+  public:
+    ConnectionTickerTask(const qpid::sys::Duration& interval, qpid::sys::Timer& t, ConnectionContext& c) :
+        TimerTask(interval, "ConnectionTicker"),
+        timer(t),
+        connection(c)
+    {}
+
+    void fire() {
+        QPID_LOG(debug, "ConnectionTickerTask fired");
+        // Setup next firing
+        setupNextFire();
+        timer.add(this);
+
+        // Send Ticker
+        connection.activateOutput();
+    }
+};
 }
 
 void ConnectionContext::trace(const char* message) const
@@ -86,60 +132,57 @@ ConnectionContext::ConnectionContext(const std::string& url, const qpid::types::
       readHeader(false),
       haveOutput(false),
       state(DISCONNECTED),
-      codecAdapter(*this)
+      codecAdapter(*this),
+      notifyOnWrite(false)
 {
     // Concatenate all known URLs into a single URL, get rid of duplicate addresses.
     sys::urlAddStrings(fullUrl, urls.begin(), urls.end(), protocol.empty() ?
                        qpid::Address::TCP : protocol);
-    if (pn_transport_bind(engine, connection)) {
-        //error
-    }
     if (identifier.empty()) {
         identifier = qpid::types::Uuid(true).str();
     }
-    pn_connection_set_container(connection, identifier.c_str());
-    bool enableTrace(false);
-    QPID_LOG_TEST_CAT(trace, protocol, enableTrace);
-    if (enableTrace) {
-        pn_transport_trace(engine, PN_TRACE_FRM);
-        set_tracer(engine, this);
-    }
+    configureConnection();
 }
 
 ConnectionContext::~ConnectionContext()
 {
+    if (ticker) ticker->cancel();
     close();
     sessions.clear();
-    pn_transport_free(engine);
     pn_connection_free(connection);
+    pn_transport_free(engine);
 }
 
 bool ConnectionContext::isOpen() const
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+    sys::Monitor::ScopedLock l(lock);
     return state == CONNECTED && pn_connection_state(connection) & (PN_LOCAL_ACTIVE | PN_REMOTE_ACTIVE);
 }
 
 void ConnectionContext::sync(boost::shared_ptr<SessionContext> ssn)
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
-    //wait for outstanding sends to settle
+    sys::Monitor::ScopedLock l(lock);
+    syncLH(ssn, l);
+}
+
+void ConnectionContext::syncLH(boost::shared_ptr<SessionContext> ssn, sys::Monitor::ScopedLock&) {
     while (!ssn->settled()) {
         QPID_LOG(debug, "Waiting for sends to settle on sync()");
         wait(ssn);//wait until message has been confirmed
+        wakeupDriver();
     }
     checkClosed(ssn);
 }
 
 void ConnectionContext::endSession(boost::shared_ptr<SessionContext> ssn)
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+    sys::Monitor::ScopedLock l(lock);
     if (pn_session_state(ssn->session) & PN_REMOTE_ACTIVE) {
-        //wait for outstanding sends to settle
-        while (!ssn->settled()) {
-            QPID_LOG(debug, "Waiting for sends to settle before closing");
-            wait(ssn);//wait until message has been confirmed
+        //explicitly release messages that have yet to be fetched
+        for (SessionContext::ReceiverMap::iterator i = ssn->receivers.begin(); i != ssn->receivers.end(); ++i) {
+            drain_and_release_messages(ssn, i->second);
         }
+        syncLH(ssn, l);
     }
 
     if (pn_session_state(ssn->session) & PN_REMOTE_ACTIVE) {
@@ -152,17 +195,11 @@ void ConnectionContext::endSession(boost::shared_ptr<SessionContext> ssn)
 
 void ConnectionContext::close()
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+    sys::Monitor::ScopedLock l(lock);
     if (state != CONNECTED) return;
     if (!(pn_connection_state(connection) & PN_LOCAL_CLOSED)) {
         for (SessionMap::iterator i = sessions.begin(); i != sessions.end(); ++i) {
-            //wait for outstanding sends to settle
-            while (!i->second->settled()) {
-                QPID_LOG(debug, "Waiting for sends to settle before closing");
-                wait(i->second);//wait until message has been confirmed
-            }
-
-
+            syncLH(i->second, l);
             if (!(pn_session_state(i->second->session) & PN_LOCAL_CLOSED)) {
                 pn_session_close(i->second->session);
             }
@@ -185,6 +222,10 @@ void ConnectionContext::close()
             lock.wait();
         }
     }
+    if (ticker) {
+        ticker->cancel();
+        ticker = boost::intrusive_ptr<qpid::sys::TimerTask>();
+    }
 }
 
 bool ConnectionContext::fetch(boost::shared_ptr<SessionContext> ssn, boost::shared_ptr<ReceiverContext> lnk, qpid::messaging::Message& message, qpid::messaging::Duration timeout)
@@ -195,7 +236,7 @@ bool ConnectionContext::fetch(boost::shared_ptr<SessionContext> ssn, boost::shar
      */
     qpid::sys::AtomicCount::ScopedIncrement track(lnk->fetching);
     {
-        qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+        sys::Monitor::ScopedLock l(lock);
         checkClosed(ssn, lnk);
         if (!lnk->capacity) {
             pn_link_flow(lnk->receiver, 1);
@@ -206,10 +247,10 @@ bool ConnectionContext::fetch(boost::shared_ptr<SessionContext> ssn, boost::shar
         return true;
     } else {
         {
-            qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+            sys::Monitor::ScopedLock l(lock);
             pn_link_drain(lnk->receiver, 0);
             wakeupDriver();
-            while (pn_link_credit(lnk->receiver) && !pn_link_queued(lnk->receiver)) {
+            while (pn_link_draining(lnk->receiver) && !pn_link_queued(lnk->receiver)) {
                 QPID_LOG(debug, "Waiting for message or for credit to be drained: credit=" << pn_link_credit(lnk->receiver) << ", queued=" << pn_link_queued(lnk->receiver));
                 wait(ssn, lnk);
             }
@@ -218,11 +259,6 @@ bool ConnectionContext::fetch(boost::shared_ptr<SessionContext> ssn, boost::shar
             }
         }
         if (get(ssn, lnk, message, qpid::messaging::Duration::IMMEDIATE)) {
-            qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
-            if (lnk->capacity) {
-                pn_link_flow(lnk->receiver, 1);
-                wakeupDriver();
-            }
             return true;
         } else {
             return false;
@@ -245,7 +281,7 @@ bool ConnectionContext::get(boost::shared_ptr<SessionContext> ssn, boost::shared
 {
     qpid::sys::AbsTime until(convert(timeout));
     while (true) {
-        qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+        sys::Monitor::ScopedLock l(lock);
         checkClosed(ssn, lnk);
         pn_delivery_t* current = pn_link_current((pn_link_t*) lnk->receiver);
         QPID_LOG(debug, "In ConnectionContext::get(), current=" << current);
@@ -260,11 +296,17 @@ bool ConnectionContext::get(boost::shared_ptr<SessionContext> ssn, boost::shared
             encoded->init(impl);
             impl.setEncoded(encoded);
             impl.setInternalId(ssn->record(current));
-            pn_link_advance(lnk->receiver);
             if (lnk->capacity) {
                 pn_link_flow(lnk->receiver, 1);
-                wakeupDriver();//TODO: wakeup less frequently
+                if (lnk->wakeupToIssueCredit()) {
+                    wakeupDriver();
+                } else {
+                    haveOutput = true;
+                }
             }
+            // Automatically ack messages if we are in a transaction.
+            if (ssn->transaction)
+                acknowledgeLH(ssn, &message, false, l);
             return true;
         } else if (until > qpid::sys::now()) {
             waitUntil(ssn, lnk, until);
@@ -279,7 +321,7 @@ boost::shared_ptr<ReceiverContext> ConnectionContext::nextReceiver(boost::shared
 {
     qpid::sys::AbsTime until(convert(timeout));
     while (true) {
-        qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+        sys::Monitor::ScopedLock l(lock);
         checkClosed(ssn);
         boost::shared_ptr<ReceiverContext> r = ssn->nextReceiver();
         if (r) {
@@ -292,9 +334,13 @@ boost::shared_ptr<ReceiverContext> ConnectionContext::nextReceiver(boost::shared
     }
 }
 
-void ConnectionContext::acknowledge(boost::shared_ptr<SessionContext> ssn, qpid::messaging::Message* message, bool cumulative)
+void ConnectionContext::acknowledge(boost::shared_ptr<SessionContext> ssn, qpid::messaging::Message* message, bool cumulative) {
+    sys::Monitor::ScopedLock l(lock);
+    acknowledgeLH(ssn, message, cumulative, l);
+}
+
+void ConnectionContext::acknowledgeLH(boost::shared_ptr<SessionContext> ssn, qpid::messaging::Message* message, bool cumulative, sys::Monitor::ScopedLock&)
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
     checkClosed(ssn);
     if (message) {
         ssn->acknowledge(MessageImplAccess::get(*message).getInternalId(), cumulative);
@@ -306,7 +352,7 @@ void ConnectionContext::acknowledge(boost::shared_ptr<SessionContext> ssn, qpid:
 
 void ConnectionContext::nack(boost::shared_ptr<SessionContext> ssn, qpid::messaging::Message& message, bool reject)
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+    sys::Monitor::ScopedLock l(lock);
     checkClosed(ssn);
     ssn->nack(MessageImplAccess::get(message).getInternalId(), reject);
     wakeupDriver();
@@ -314,7 +360,7 @@ void ConnectionContext::nack(boost::shared_ptr<SessionContext> ssn, qpid::messag
 
 void ConnectionContext::detach(boost::shared_ptr<SessionContext> ssn, boost::shared_ptr<SenderContext> lnk)
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+    sys::Monitor::ScopedLock l(lock);
     if (pn_link_state(lnk->sender) & PN_LOCAL_ACTIVE) {
         lnk->close();
     }
@@ -325,9 +371,8 @@ void ConnectionContext::detach(boost::shared_ptr<SessionContext> ssn, boost::sha
     ssn->removeSender(lnk->getName());
 }
 
-void ConnectionContext::detach(boost::shared_ptr<SessionContext> ssn, boost::shared_ptr<ReceiverContext> lnk)
+void ConnectionContext::drain_and_release_messages(boost::shared_ptr<SessionContext> ssn, boost::shared_ptr<ReceiverContext> lnk)
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
     pn_link_drain(lnk->receiver, 0);
     wakeupDriver();
     //Not all implementations handle drain correctly, so limit the
@@ -343,6 +388,12 @@ void ConnectionContext::detach(boost::shared_ptr<SessionContext> ssn, boost::sha
         pn_delivery_update(d, PN_RELEASED);
         pn_delivery_settle(d);
     }
+}
+
+void ConnectionContext::detach(boost::shared_ptr<SessionContext> ssn, boost::shared_ptr<ReceiverContext> lnk)
+{
+    sys::Monitor::ScopedLock l(lock);
+    drain_and_release_messages(ssn, lnk);
     if (pn_link_state(lnk->receiver) & PN_LOCAL_ACTIVE) {
         lnk->close();
     }
@@ -355,7 +406,6 @@ void ConnectionContext::detach(boost::shared_ptr<SessionContext> ssn, boost::sha
 
 void ConnectionContext::attach(boost::shared_ptr<SessionContext> ssn, boost::shared_ptr<SenderContext> lnk)
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
     lnk->configure();
     attach(ssn, lnk->sender);
     checkClosed(ssn, lnk);
@@ -365,7 +415,6 @@ void ConnectionContext::attach(boost::shared_ptr<SessionContext> ssn, boost::sha
 
 void ConnectionContext::attach(boost::shared_ptr<SessionContext> ssn, boost::shared_ptr<ReceiverContext> lnk)
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
     lnk->configure();
     attach(ssn, lnk->receiver, lnk->capacity);
     checkClosed(ssn, lnk);
@@ -385,67 +434,130 @@ void ConnectionContext::attach(boost::shared_ptr<SessionContext> ssn, pn_link_t*
     }
 }
 
-void ConnectionContext::send(boost::shared_ptr<SessionContext> ssn, boost::shared_ptr<SenderContext> snd, const qpid::messaging::Message& message, bool sync)
+boost::shared_ptr<SenderContext> ConnectionContext::createSender(boost::shared_ptr<SessionContext> session, const qpid::messaging::Address& address)
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+    sys::Monitor::ScopedLock l(lock);
+    boost::shared_ptr<SenderContext> sender = session->createSender(address, setToOnSend);
+    try {
+        attach(session, sender);
+        return sender;
+    } catch (...) {
+        session->removeSender(sender->getName());
+        throw;
+    }
+
+}
+boost::shared_ptr<ReceiverContext> ConnectionContext::createReceiver(boost::shared_ptr<SessionContext> session, const qpid::messaging::Address& address)
+{
+    sys::Monitor::ScopedLock l(lock);
+    boost::shared_ptr<ReceiverContext> receiver = session->createReceiver(address);
+    try {
+        attach(session, receiver);
+        return receiver;
+    } catch (...) {
+        session->removeReceiver(receiver->getName());
+        throw;
+    }
+}
+boost::shared_ptr<SenderContext> ConnectionContext::getSender(boost::shared_ptr<SessionContext> session, const std::string& name) const
+{
+    sys::Monitor::ScopedLock l(lock);
+    return session->getSender(name);
+}
+
+boost::shared_ptr<ReceiverContext> ConnectionContext::getReceiver(boost::shared_ptr<SessionContext> session, const std::string& name) const
+{
+    sys::Monitor::ScopedLock l(lock);
+    return session->getReceiver(name);
+}
+
+void ConnectionContext::send(
+    boost::shared_ptr<SessionContext> ssn,
+    boost::shared_ptr<SenderContext> snd,
+    const qpid::messaging::Message& message,
+    bool sync,
+    SenderContext::Delivery** delivery)
+{
+    sys::Monitor::ScopedLock l(lock);
+    sendLH(ssn, snd, message, sync, delivery, l);
+}
+
+void ConnectionContext::sendLH(
+    boost::shared_ptr<SessionContext> ssn,
+    boost::shared_ptr<SenderContext> snd,
+    const qpid::messaging::Message& message,
+    bool sync,
+    SenderContext::Delivery** delivery,
+    sys::Monitor::ScopedLock&)
+{
     checkClosed(ssn);
-    SenderContext::Delivery* delivery(0);
-    while (!snd->send(message, &delivery)) {
+    while (pn_transport_pending(engine) > 65536) {
+        QPID_LOG(debug, "Have " << pn_transport_pending(engine) << " bytes of output pending; waiting for this to be written...");
+        notifyOnWrite = true;
+        wakeupDriver();
+        wait(ssn, snd);
+        notifyOnWrite = false;
+    }
+    while (!snd->send(message, delivery)) {
         QPID_LOG(debug, "Waiting for capacity...");
         wait(ssn, snd);//wait for capacity
     }
     wakeupDriver();
-    if (sync && delivery) {
-        while (!delivery->accepted()) {
+    if (sync && *delivery) {
+        while (!(*delivery)->delivered()) {
             QPID_LOG(debug, "Waiting for confirmation...");
             wait(ssn, snd);//wait until message has been confirmed
         }
+        if ((*delivery)->rejected()) {
+            throw MessageRejected("Message was rejected by peer");
+        }
+
     }
 }
 
 void ConnectionContext::setCapacity(boost::shared_ptr<SenderContext> sender, uint32_t capacity)
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+    sys::Monitor::ScopedLock l(lock);
     sender->setCapacity(capacity);
 }
 uint32_t ConnectionContext::getCapacity(boost::shared_ptr<SenderContext> sender)
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+    sys::Monitor::ScopedLock l(lock);
     return sender->getCapacity();
 }
 uint32_t ConnectionContext::getUnsettled(boost::shared_ptr<SenderContext> sender)
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+    sys::Monitor::ScopedLock l(lock);
     return sender->getUnsettled();
 }
 
 void ConnectionContext::setCapacity(boost::shared_ptr<ReceiverContext> receiver, uint32_t capacity)
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+    sys::Monitor::ScopedLock l(lock);
     receiver->setCapacity(capacity);
     pn_link_flow((pn_link_t*) receiver->receiver, receiver->getCapacity());
     wakeupDriver();
 }
 uint32_t ConnectionContext::getCapacity(boost::shared_ptr<ReceiverContext> receiver)
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+    sys::Monitor::ScopedLock l(lock);
     return receiver->getCapacity();
 }
 uint32_t ConnectionContext::getAvailable(boost::shared_ptr<ReceiverContext> receiver)
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+    sys::Monitor::ScopedLock l(lock);
     return receiver->getAvailable();
 }
 uint32_t ConnectionContext::getUnsettled(boost::shared_ptr<ReceiverContext> receiver)
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+    sys::Monitor::ScopedLock l(lock);
     return receiver->getUnsettled();
 }
 
 void ConnectionContext::activateOutput()
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
-    wakeupDriver();
+    sys::Monitor::ScopedLock l(lock);
+    if (state == CONNECTED) wakeupDriver();
 }
 /**
  * Expects lock to be held by caller
@@ -472,22 +584,19 @@ pn_state_t IS_CLOSED = PN_LOCAL_CLOSED | PN_REMOTE_CLOSED;
 
 void ConnectionContext::reset()
 {
-    pn_transport_free(engine);
     pn_connection_free(connection);
+    pn_transport_free(engine);
 
     engine = pn_transport();
     connection = pn_connection();
-    pn_connection_set_container(connection, identifier.c_str());
-    bool enableTrace(false);
-    QPID_LOG_TEST_CAT(trace, protocol, enableTrace);
-    if (enableTrace) pn_transport_trace(engine, PN_TRACE_FRM);
+    configureConnection();
+
     for (SessionMap::iterator i = sessions.begin(); i != sessions.end(); ++i) {
         i->second->reset(connection);
     }
-    pn_transport_bind(engine, connection);
 }
 
-void ConnectionContext::check() {
+bool ConnectionContext::check() {
     if (checkDisconnected()) {
         if (ConnectionOptions::reconnect) {
             QPID_LOG(notice, "Auto-reconnecting to " << fullUrl);
@@ -496,7 +605,9 @@ void ConnectionContext::check() {
         } else {
             throw qpid::messaging::TransportFailure("Disconnected (reconnect disabled)");
         }
+        return true;
     }
+    return false;
 }
 
 bool ConnectionContext::checkDisconnected() {
@@ -504,15 +615,9 @@ bool ConnectionContext::checkDisconnected() {
         reset();
     } else {
         if ((pn_connection_state(connection) & REQUIRES_CLOSE) == REQUIRES_CLOSE) {
-            pn_condition_t* error = pn_connection_remote_condition(connection);
-            std::stringstream text;
-            if (pn_condition_is_set(error)) {
-                text << "Connection closed by peer with " << pn_condition_get_name(error) << ": " << pn_condition_get_description(error);
-            } else {
-                text << "Connection closed by peer";
-            }
+            std::string text = get_error_string(pn_connection_remote_condition(connection), "Connection closed by peer");
             pn_connection_close(connection);
-            throw qpid::messaging::ConnectionError(text.str());
+            throw qpid::messaging::ConnectionError(text);
         }
     }
     return state == DISCONNECTED;
@@ -520,7 +625,7 @@ bool ConnectionContext::checkDisconnected() {
 
 void ConnectionContext::wait()
 {
-    check();
+    if (check()) return;        // Reconnected, may need to re-test condition.
     lock.wait();
     check();
 }
@@ -562,16 +667,11 @@ void ConnectionContext::waitUntil(boost::shared_ptr<SessionContext> ssn, boost::
 void ConnectionContext::checkClosed(boost::shared_ptr<SessionContext> ssn)
 {
     check();
+    ssn->error.raise();
     if ((pn_session_state(ssn->session) & REQUIRES_CLOSE) == REQUIRES_CLOSE) {
-        pn_condition_t* error = pn_session_remote_condition(ssn->session);
-        std::stringstream text;
-        if (pn_condition_is_set(error)) {
-            text << "Session ended by peer with " << pn_condition_get_name(error) << ": " << pn_condition_get_description(error);
-        } else {
-            text << "Session ended by peer";
-        }
+        std::string text = get_error_string(pn_session_remote_condition(ssn->session), "Session ended by peer");
         pn_session_close(ssn->session);
-        throw qpid::messaging::SessionError(text.str());
+        throw qpid::messaging::SessionError(text);
     } else if ((pn_session_state(ssn->session) & IS_CLOSED) == IS_CLOSED) {
         throw qpid::messaging::SessionClosed();
     }
@@ -599,21 +699,15 @@ void ConnectionContext::checkClosed(boost::shared_ptr<SessionContext> ssn, pn_li
     checkClosed(ssn);
     if ((pn_link_state(lnk) & REQUIRES_CLOSE) == REQUIRES_CLOSE) {
         pn_condition_t* error = pn_link_remote_condition(lnk);
-        std::string name;
-        std::stringstream text;
-        if (pn_condition_is_set(error)) {
-            name = pn_condition_get_name(error);
-            text << "Link detached by peer with " << name << ": " << pn_condition_get_description(error);
-        } else {
-            text << "Link detached by peer";
-        }
+        std::string text = get_error_string(error, "Link detached by peer");
         pn_link_close(lnk);
+        std::string name = pn_condition_get_name(error);
         if (name == qpid::amqp::error_conditions::NOT_FOUND) {
-            throw qpid::messaging::NotFound(text.str());
+            throw qpid::messaging::NotFound(text);
         } else if (name == qpid::amqp::error_conditions::UNAUTHORIZED_ACCESS) {
-            throw qpid::messaging::UnauthorizedAccess(text.str());
+            throw qpid::messaging::UnauthorizedAccess(text);
         } else {
-            throw qpid::messaging::LinkError(text.str());
+            throw qpid::messaging::LinkError(text);
         }
     } else if ((pn_link_state(lnk) & IS_CLOSED) == IS_CLOSED) {
         throw qpid::messaging::LinkError("Link is not attached");
@@ -622,6 +716,7 @@ void ConnectionContext::checkClosed(boost::shared_ptr<SessionContext> ssn, pn_li
 
 void ConnectionContext::restartSession(boost::shared_ptr<SessionContext> s)
 {
+    if (s->error) return;
     pn_session_open(s->session);
     wakeupDriver();
     while (pn_session_state(s->session) & PN_REMOTE_UNINIT) {
@@ -650,26 +745,31 @@ void ConnectionContext::restartSession(boost::shared_ptr<SessionContext> s)
 
 boost::shared_ptr<SessionContext> ConnectionContext::newSession(bool transactional, const std::string& n)
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
-    if (transactional) throw qpid::messaging::MessagingException("Transactions not yet supported");
+    boost::shared_ptr<SessionContext> session;
     std::string name = n.empty() ? qpid::framing::Uuid(true).str() : n;
-    SessionMap::const_iterator i = sessions.find(name);
-    if (i == sessions.end()) {
-        boost::shared_ptr<SessionContext> s(new SessionContext(connection));
-        s->setName(name);
-        s->session = pn_session(connection);
-        pn_session_open(s->session);
-        wakeupDriver();
-        while (pn_session_state(s->session) & PN_REMOTE_UNINIT) {
-            wait();
+    {
+        sys::Monitor::ScopedLock l(lock);
+        SessionMap::const_iterator i = sessions.find(name);
+        if (i == sessions.end()) {
+            session = boost::shared_ptr<SessionContext>(new SessionContext(connection));
+            session->setName(name);
+            pn_session_open(session->session);
+            wakeupDriver();
+            sessions[name] = session; // Add it now so it will be restarted if we reconnect in wait()
+            while (pn_session_state(session->session) & PN_REMOTE_UNINIT) {
+                wait();
+            }
+        } else {
+            throw qpid::messaging::KeyError(std::string("Session already exists: ") + name);
         }
-        sessions[name] = s;
-        return s;
-    } else {
-        throw qpid::messaging::KeyError(std::string("Session already exists: ") + name);
-    }
 
+    }
+    if (transactional) {        // Outside of lock
+        startTxSession(session);
+    }
+    return session;
 }
+
 boost::shared_ptr<SessionContext> ConnectionContext::getSession(const std::string& name) const
 {
     SessionMap::const_iterator i = sessions.find(name);
@@ -692,7 +792,7 @@ std::string ConnectionContext::getAuthenticatedUsername()
 
 std::size_t ConnectionContext::decodePlain(const char* buffer, std::size_t size)
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+    sys::Monitor::ScopedLock l(lock);
     QPID_LOG(trace, id << " decode(" << size << ")");
     if (readHeader) {
         size_t decoded = readProtocolHeader(buffer, size);
@@ -705,16 +805,31 @@ std::size_t ConnectionContext::decodePlain(const char* buffer, std::size_t size)
     //TODO: Fix pn_engine_input() to take const buffer
     ssize_t n = pn_transport_input(engine, const_cast<char*>(buffer), size);
     if (n > 0 || n == PN_EOS) {
-        //If engine returns EOS, have no way of knowing how many bytes
-        //it processed, but can assume none need to be reprocessed so
-        //consider them all read:
-        if (n == PN_EOS) n = size;
+        // PN_EOS either means we received a Close (which also means we've
+        // consumed all the input), OR some Very Bad Thing happened and this
+        // connection is toast.
+        if (n == PN_EOS)
+        {
+            std::string error;
+            if (checkTransportError(error)) {
+                // "He's dead, Jim."
+                QPID_LOG_CAT(error, network, id << " connection failed: " << error);
+                transport->abort();
+                return 0;
+            } else {
+                n = size;   // assume all consumed
+            }
+        }
         QPID_LOG_CAT(debug, network, id << " decoded " << n << " bytes from " << size)
-        pn_transport_tick(engine, 0);
+        pn_transport_tick(engine, qpid::sys::Duration::FromEpoch() / qpid::sys::TIME_MSEC);
         lock.notifyAll();
         return n;
     } else if (n == PN_ERR) {
-        throw MessagingException(QPID_MSG("Error on input: " << getError()));
+        std::string error;
+        checkTransportError(error);
+        QPID_LOG_CAT(error, network, id << " connection error: " << error);
+        transport->abort();
+        return 0;
     } else {
         return 0;
     }
@@ -722,7 +837,7 @@ std::size_t ConnectionContext::decodePlain(const char* buffer, std::size_t size)
 }
 std::size_t ConnectionContext::encodePlain(char* buffer, std::size_t size)
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+    sys::Monitor::ScopedLock l(lock);
     QPID_LOG(trace, id << " encode(" << size << ")");
     if (writeHeader) {
         size_t encoded = writeProtocolHeader(buffer, size);
@@ -736,12 +851,23 @@ std::size_t ConnectionContext::encodePlain(char* buffer, std::size_t size)
     if (n > 0) {
         QPID_LOG_CAT(debug, network, id << " encoded " << n << " bytes from " << size)
         haveOutput = true;
+        if (notifyOnWrite) lock.notifyAll();
         return n;
     } else if (n == PN_ERR) {
-        throw MessagingException(QPID_MSG("Error on output: " << getError()));
+        std::string error;
+        checkTransportError(error);
+        QPID_LOG_CAT(error, network, id << " connection error: " << error);
+        transport->abort();
+        return 0;
     } else if (n == PN_EOS) {
         haveOutput = false;
-        return 0;//Is this right?
+        // Normal close, or error?
+        std::string error;
+        if (checkTransportError(error)) {
+            QPID_LOG_CAT(error, network, id << " connection failed: " << error);
+            transport->abort();
+        }
+        return 0;
     } else {
         haveOutput = false;
         return 0;
@@ -749,18 +875,19 @@ std::size_t ConnectionContext::encodePlain(char* buffer, std::size_t size)
 }
 bool ConnectionContext::canEncodePlain()
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+    sys::Monitor::ScopedLock l(lock);
+    pn_transport_tick(engine, qpid::sys::Duration::FromEpoch() / qpid::sys::TIME_MSEC);
     return haveOutput && state == CONNECTED;
 }
 void ConnectionContext::closed()
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+    sys::Monitor::ScopedLock l(lock);
     state = DISCONNECTED;
     lock.notifyAll();
 }
 void ConnectionContext::opened()
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+    sys::Monitor::ScopedLock l(lock);
     state = CONNECTED;
     lock.notifyAll();
 }
@@ -774,12 +901,7 @@ qpid::framing::ProtocolVersion AMQP_1_0_PLAIN(1,0,qpid::framing::ProtocolVersion
 
 std::string ConnectionContext::getError()
 {
-    std::stringstream text;
-    pn_error_t* cerror = pn_connection_error(connection);
-    if (cerror) text << "connection error " << pn_error_text(cerror);
-    pn_error_t* terror = pn_transport_error(engine);
-    if (terror) text << "transport error " << pn_error_text(terror);
-    return text.str();
+    return get_error(connection, engine);
 }
 
 framing::ProtocolVersion ConnectionContext::getVersion() const
@@ -831,39 +953,52 @@ const qpid::messaging::ConnectionOptions* ConnectionContext::getOptions()
 
 std::size_t ConnectionContext::decode(const char* buffer, std::size_t size)
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+    sys::Monitor::ScopedLock l(lock);
     size_t decoded = 0;
-    if (sasl.get() && !sasl->authenticated()) {
-        decoded = sasl->decode(buffer, size);
-        if (!sasl->authenticated()) return decoded;
-    }
-    if (decoded < size) {
-        if (sasl.get() && sasl->getSecurityLayer()) decoded += sasl->getSecurityLayer()->decode(buffer+decoded, size-decoded);
-        else decoded += decodePlain(buffer+decoded, size-decoded);
+    try {
+        if (sasl.get() && !sasl->authenticated()) {
+            decoded = sasl->decode(buffer, size);
+            if (!sasl->authenticated()) return decoded;
+        }
+        if (decoded < size) {
+            if (sasl.get() && sasl->getSecurityLayer()) decoded += sasl->getSecurityLayer()->decode(buffer+decoded, size-decoded);
+            else decoded += decodePlain(buffer+decoded, size-decoded);
+        }
+    } catch (const AuthenticationFailure&) {
+        transport->close();
     }
     return decoded;
 }
 std::size_t ConnectionContext::encode(char* buffer, std::size_t size)
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+    sys::Monitor::ScopedLock l(lock);
     size_t encoded = 0;
-    if (sasl.get() && sasl->canEncode()) {
-        encoded += sasl->encode(buffer, size);
-        if (!sasl->authenticated()) return encoded;
-    }
-    if (encoded < size) {
-        if (sasl.get() && sasl->getSecurityLayer()) encoded += sasl->getSecurityLayer()->encode(buffer+encoded, size-encoded);
-        else encoded += encodePlain(buffer+encoded, size-encoded);
+    try {
+        if (sasl.get() && sasl->canEncode()) {
+            encoded += sasl->encode(buffer, size);
+            if (!sasl->authenticated()) return encoded;
+        }
+        if (encoded < size) {
+            if (sasl.get() && sasl->getSecurityLayer()) encoded += sasl->getSecurityLayer()->encode(buffer+encoded, size-encoded);
+            else encoded += encodePlain(buffer+encoded, size-encoded);
+        }
+    } catch (const AuthenticationFailure&) {
+        transport->close();
     }
     return encoded;
 }
 bool ConnectionContext::canEncode()
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+    sys::Monitor::ScopedLock l(lock);
     if (sasl.get()) {
-        if (sasl->canEncode()) return true;
-        else if (!sasl->authenticated()) return false;
-        else if (sasl->getSecurityLayer()) return sasl->getSecurityLayer()->canEncode();
+        try {
+            if (sasl->canEncode()) return true;
+            else if (!sasl->authenticated()) return false;
+            else if (sasl->getSecurityLayer()) return sasl->getSecurityLayer()->canEncode();
+        } catch (const AuthenticationFailure&) {
+            transport->close();
+            return false;
+        }
     }
     return canEncodePlain();
 }
@@ -872,30 +1007,24 @@ namespace {
 const std::string CLIENT_PROCESS_NAME("qpid.client_process");
 const std::string CLIENT_PID("qpid.client_pid");
 const std::string CLIENT_PPID("qpid.client_ppid");
-pn_bytes_t convert(const std::string& s)
-{
-    pn_bytes_t result;
-    result.start = const_cast<char*>(s.data());
-    result.size = s.size();
-    return result;
-}
 }
 void ConnectionContext::setProperties()
 {
-    pn_data_t* data = pn_connection_properties(connection);
-    pn_data_put_map(data);
-    pn_data_enter(data);
-
-    pn_data_put_symbol(data, convert(CLIENT_PROCESS_NAME));
-    std::string processName = sys::SystemInfo::getProcessName();
-    pn_data_put_string(data, convert(processName));
-
-    pn_data_put_symbol(data, convert(CLIENT_PID));
-    pn_data_put_int(data, sys::SystemInfo::getProcessId());
-
-    pn_data_put_symbol(data, convert(CLIENT_PPID));
-    pn_data_put_int(data, sys::SystemInfo::getParentProcessId());
-    pn_data_exit(data);
+    PnData data(pn_connection_properties(connection));
+    pn_data_put_map(data.data);
+    pn_data_enter(data.data);
+    data.putSymbol(CLIENT_PROCESS_NAME);
+    data.putSymbol(sys::SystemInfo::getProcessName());
+    data.putSymbol(CLIENT_PID);
+    data.put(int32_t(sys::SystemInfo::getProcessId()));
+    data.putSymbol(CLIENT_PPID);
+    data.put(int32_t(sys::SystemInfo::getParentProcessId()));
+    for (Variant::Map::const_iterator i = properties.begin(); i != properties.end(); ++i)
+    {
+        data.putSymbol(i->first);
+        data.put(i->second);
+    }
+    pn_data_exit(data.data);
 }
 
 const qpid::sys::SecuritySettings* ConnectionContext::getTransportSecuritySettings()
@@ -905,7 +1034,7 @@ const qpid::sys::SecuritySettings* ConnectionContext::getTransportSecuritySettin
 
 void ConnectionContext::open()
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+    sys::Monitor::ScopedLock l(lock);
     if (state != DISCONNECTED) throw qpid::messaging::ConnectionError("Connection was already opened!");
     if (!driver) driver = DriverImpl::getDefault();
     QPID_LOG(info, "Starting connection to " << fullUrl);
@@ -947,7 +1076,7 @@ void ConnectionContext::autoconnect()
 
 void ConnectionContext::reconnect(const Url& url) {
     QPID_LOG(notice, "Reconnecting to " << url);
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+    sys::Monitor::ScopedLock l(lock);
     if (state != DISCONNECTED) throw qpid::messaging::ConnectionError("Connection was already opened!");
     if (!driver) driver = DriverImpl::getDefault();
     reset();
@@ -1000,7 +1129,6 @@ bool ConnectionContext::tryOpenAddr(const qpid::Address& addr) {
     }
 
     QPID_LOG(debug, id << " Opening...");
-    setProperties();
     pn_connection_open(connection);
     wakeupDriver(); //want to write
     while ((pn_connection_state(connection) & PN_REMOTE_UNINIT) &&
@@ -1010,6 +1138,25 @@ bool ConnectionContext::tryOpenAddr(const qpid::Address& addr) {
     if (!(pn_connection_state(connection) & PN_REMOTE_ACTIVE)) {
         throw qpid::messaging::ConnectionError("Failed to open connection");
     }
+
+    // Connection open - check for idle timeout from the remote and start a
+    // periodic tick to monitor for idle connections
+    pn_timestamp_t remote = pn_transport_get_remote_idle_timeout(engine);
+    pn_timestamp_t local = pn_transport_get_idle_timeout(engine);
+    uint64_t shortest = ((remote && local)
+                         ? std::min(remote, local)
+                         : (remote) ? remote : local);
+    if (shortest) {
+        // send an idle frame at least twice before timeout
+        shortest = (shortest + 1)/2;
+        qpid::sys::Duration d(shortest * qpid::sys::TIME_MSEC);
+        ticker = boost::intrusive_ptr<qpid::sys::TimerTask>(new ConnectionTickerTask(d, driver->getTimer(), *this));
+        driver->getTimer().add(ticker);
+        QPID_LOG(debug, id << " AMQP 1.0 idle-timeout set:"
+                 << " local=" << pn_transport_get_idle_timeout(engine)
+                 << " remote=" << pn_transport_get_remote_idle_timeout(engine));
+    }
+
     QPID_LOG(debug, id << " Opened");
 
     return restartSessions();
@@ -1017,7 +1164,7 @@ bool ConnectionContext::tryOpenAddr(const qpid::Address& addr) {
 
 std::string ConnectionContext::getUrl() const
 {
-    qpid::sys::ScopedLock<qpid::sys::Monitor> l(lock);
+    sys::Monitor::ScopedLock l(lock);
     return (state == CONNECTED) ? currentUrl.str() : std::string();
 }
 
@@ -1089,5 +1236,82 @@ bool ConnectionContext::CodecAdapter::canEncode()
     return context.canEncodePlain();
 }
 
+void ConnectionContext::startTxSession(boost::shared_ptr<SessionContext> session) {
+    try {
+        QPID_LOG(debug, id << " attaching transaction for " << session->getName());
+        boost::shared_ptr<Transaction> tx(new Transaction(session->session));
+        session->transaction = tx;
+        {
+            sys::Monitor::ScopedLock l(lock);
+            attach(session, boost::shared_ptr<SenderContext>(tx));
+        }
+        tx->declare(boost::bind(&ConnectionContext::send, this, _1, _2, _3, _4, _5), session);
+    } catch (const Exception& e) {
+        throw TransactionError(Msg() << "Cannot start transaction: " << e.what());
+    }
+}
 
+void ConnectionContext::discharge(boost::shared_ptr<SessionContext> session, bool fail) {
+    {
+        sys::Monitor::ScopedLock l(lock);
+        checkClosed(session);
+        if (!session->transaction)
+            throw TransactionError("No Transaction");
+        Transaction::SendFunction sendFn = boost::bind(
+            &ConnectionContext::sendLH, this, _1, _2, _3, _4, _5, boost::ref(l));
+        syncLH(session, boost::ref(l)); // Sync to make sure all tx transfers have been received.
+        session->transaction->discharge(sendFn, session, fail);
+        session->transaction->declare(sendFn, session);
+    }
+}
+
+void ConnectionContext::commit(boost::shared_ptr<SessionContext> session) {
+    discharge(session, false);
+}
+
+void ConnectionContext::rollback(boost::shared_ptr<SessionContext> session) {
+    discharge(session, true);
+}
+
+
+// setup the transport and connection objects:
+void ConnectionContext::configureConnection()
+{
+    pn_connection_set_container(connection, identifier.c_str());
+    setProperties();
+    if (heartbeat) {
+        // fail an idle connection at 2 x heartbeat (in msecs)
+        pn_transport_set_idle_timeout(engine, heartbeat*2*1000);
+    }
+
+    bool enableTrace(false);
+    QPID_LOG_TEST_CAT(trace, protocol, enableTrace);
+    if (enableTrace) {
+        pn_transport_trace(engine, PN_TRACE_FRM);
+        set_tracer(engine, this);
+    }
+
+    int err = pn_transport_bind(engine, connection);
+    if (err)
+        QPID_LOG(error, id << " Error binding connection and transport: " << err);
+}
+
+
+// check for failures of the transport:
+bool ConnectionContext::checkTransportError(std::string& text)
+{
+    std::stringstream info;
+
+#ifdef USE_PROTON_TRANSPORT_CONDITION
+    pn_condition_t* tcondition = pn_transport_condition(engine);
+    if (pn_condition_is_set(tcondition))
+        info << get_error_string(tcondition, "transport error", ": ");
+#else
+    pn_error_t* terror = pn_transport_error(engine);
+    if (terror) info << "transport error " << pn_error_text(terror) << " [" << terror << "]";
+#endif
+
+    text = info.str();
+    return !text.empty();
+}
 }}} // namespace qpid::messaging::amqp
