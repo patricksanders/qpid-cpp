@@ -1,68 +1,12 @@
-#
-# Licensed to the Apache Software Foundation (ASF) under one
-# or more contributor license agreements.  See the NOTICE file
-# distributed with this work for additional information
-# regarding copyright ownership.  The ASF licenses this file
-# to you under the Apache License, Version 2.0 (the
-# "License"); you may not use this file except in compliance
-# with the License.  You may obtain a copy of the License at
-#
-#   http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing,
-# software distributed under the License is distributed on an
-# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-# KIND, either express or implied.  See the License for the
-# specific language governing permissions and limitations
-# under the License.
-#
+This project is for building a .deb package from the Apache Qpid source.
 
-            Qpid/C++
-            ========
+Current requirements (as far as I've deduced)
+From debian repositories:
+build-essential debhelper libboost-all-dev uuid-dev libsasl2-dev libxqilla-dev libxmltooling-dev libibverbs-dev librdmacm-dev libnspr4-dev libnss3-dev libssl-dev sasl2-bin corosync-dev libxerces-c-dev doxygen help2man valgrind zip procps libnss3-tools pkg-config dpkg-dev chrpath libqpid-proton2-dev cmake swig ruby python-dev python-qpid libaio-dev libdb5.3++-dev libdb++-dev corosync-dev libxmltooling-dev libqpid-proton2-dev 
 
-Table of Contents
-=================
-1. Introduction
-2. Available Documentation
-3. Quick start
+From pip:
+qpid-tools
 
+Build command (note: this skips tests. probably not a great idea):
+DEB_BUILD_OPTIONS=nocheck dpkg-buildpackage -us -uc
 
-1. Introduction
-===============
-Qpid/C++ is a C++ implementation of the AMQP protcol described at
-http://amqp.org/
-
-For additional software or information on the Qpid project go to:
-
-   http://qpid.apache.org
-
-For documentation, go to:
-
-   http://qpid.apache.org/documentation
-
-
-2. Available Documentation
-==========================
-  - INSTALL       - How to install Qpid/C++.
-  - SSL           - How to setup SSL
-  - RELEASE_NOTES - Release notes.
-  - DESIGN        - Qpid/C++ implementation.
-  - LICENSE       - Apache license.
-  - NOTICE        - Corresponds to the section 4 d of 
-                    the Apache License, Version 2.0.
-
-3. Quick start
-==============
-
-In C++ distributions:
-
-   mkdir BLD      # The recommended way to use cmake is in a separate build directory
-   cd BLD
-   cmake ..       # Generates code and makefiles
-   make test      # Runs tests
-   make install   # Installs the client and daemon
-
-The INSTALL notes contain more detailed information on compiling and
-installing this software.
-
-qpid/cpp/examples/README.txt describes the C++ client API examples.
